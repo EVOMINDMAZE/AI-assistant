@@ -837,7 +837,63 @@ Each of these is a follow-up. None blocks the demo.
 
 ---
 
-## 12. Open questions for the user
+## 12. What else is still needed (round 3 candidates)
+
+You asked what's missing beyond the swarm itself. Here's a tiered list — the things that *block the app from working correctly* are at the top, the things that make it *better* are in the middle, and the *v2 nice-to-haves* are at the bottom.
+
+### 12.1 Tier 1 — Required for the app to function correctly
+
+| # | Item | Why it's needed | Effort | Notes |
+|---|---|---|---|---|
+| T1.1 | **Error handling & retry** | DeepSeek rate-limits, tool throws, CoS stream dies mid-sentence. Without explicit error paths, one failure cascades into a broken chat. | S | Wrap each `Runner.runStreamed` in try/catch; on transient errors, retry once with backoff; on permanent errors, emit an `error` SSE event and persist what we have. |
+| T1.2 | **Per-conversation rate limiting** | The user could accidentally trigger a 1000-turn loop (e.g. "loop" + conflict resolution). Without a cap, the API bill is unbounded. | S | Cap at 60 turns/conversation and 200 turns/hour. The CoS's `agent_state.turn_count` is already a natural counter. |
+| T1.3 | **Tracing / observability** | When the swarm misbehaves, we need to know which specialist said what, in what order, with what tool calls. The OpenAI Agents SDK has built-in tracing — we just need to wire it somewhere. | M | Default to the SDK's built-in console trace. Add a small SQLite-backed trace log so traces survive server restarts. A LangSmith integration is a v2 follow-up. |
+| T1.4 | **Eval harness (golden questions)** | Without a regression suite, every prompt tweak risks breaking the CoS. A formal eval harness is overkill for the MVP, but we need at least 10-20 golden questions with expected behaviors. | M | `eval/golden.yaml` with `input → expected_substrings, expected_specialists, expected_no_specialists`. Run after every prompt change. |
+| T1.5 | **`sandbox-escape` security review** | `run_code` accepts arbitrary JS. We need an explicit test suite that tries to break out of the sandbox (`require('fs')`, `process.exit`, `globalThis.fetch`, prototype pollution, infinite loops). | S | 30-line test file. Block ships until all attempts fail. |
+| T1.6 | **Backup / restore** | The user has years of memory. Losing PocketBase + Qdrant is catastrophic. We need a one-command backup. | S | `scripts/backup.sh` dumps PB (SQLite) + Qdrant snapshots. Cron on the cloud VM. |
+| T1.7 | **Update path for prompts / agents** | When we add an agent or change a prompt, we need to ship the change without losing user state. PB is additive (new collections OK); Qdrant is additive (new collection names OK); the only risk is breaking existing tool schemas. | S | Pin tool versions in `tool_manifest.json`. The Runner checks at startup. |
+| T1.8 | **PII purge / "forget me"** | GDPR-ish: the user must be able to delete a fact, a conversation, or everything. Mem0 supports `delete_all(user_id)` already. | S | Add a "Forget this" button on the Memory panel + a "Delete all my data" command. |
+
+### 12.2 Tier 2 — Important, can ship without but should land within a few weeks
+
+| # | Item | Why it matters | Effort |
+|---|---|---|---|
+| T2.1 | **Even a single-password auth** | The cloud deployment is reachable over HTTPS. Without at least a shared password, the swarm and the user's memories are public. | S |
+| T2.2 | **Cost observability** | Token usage per turn, per agent, per day. Show in the UI as a small "💰 $0.12 today" widget. | M |
+| T2.3 | **Search across conversation history** | The user wants to find "that conversation about X from 3 weeks ago". We already have `search_documents` on Qdrant; add `search_messages` for raw chat. | M |
+| T2.4 | **Conflict resolution UI polish** | The `ConflictCard` needs to show context, allow "ask again", and let the user re-pick. | M |
+| T2.5 | **Unit + integration tests** | Tests for the tools (`compute`, `run_code` sandbox escapes), state/messaging PB wrappers, the consult tool's depth counter, the small-talk fast path. | M |
+| T2.6 | **Resilient SSE** | The current client breaks if the connection drops mid-stream. Add a `Last-Event-Id` resume path. | S |
+
+### 12.3 Tier 3 — v2 follow-ups (nice-to-haves)
+
+| # | Item | Why we want it eventually | Effort | Why not v1 |
+|---|---|---|---|---|
+| T3.1 | **Real Python sandbox (Pyodide or Docker worker)** | CFO/CSO would benefit from pandas, numpy, requests. | L | Adds ~10 MB cold start (Pyodide) or a new container (Docker). Not blocking — the JS sandbox handles 90% of use cases. |
+| T3.2 | **`isolated-vm` instead of `node:vm`** | True per-call memory caps. `node:vm` shares the V8 heap, so a malicious snippet can OOM the whole Next.js process. | M | Adds a native dep (~30 MB compiled). Default to `node:vm`; switch if we hit any crashes. |
+| T3.3 | **LangSmith / Phoenix tracing backend** | Beautiful UIs for swarm traces. | M | Cost ($$) and one more vendor. The built-in console + SQLite trace is enough for the MVP. |
+| T3.4 | **Multi-device sync (push notifications, mobile UI)** | The user uses laptop + phone. The swarm should be reachable from both. | L | Not in the user's brief for the MVP. |
+| T3.5 | **Voice input / TTS output** | The ADHD Coach + CoS as a daily-driver voice agent. | L | OpenAI Realtime API integration. Deferred. |
+| T3.6 | **Encrypted at rest** | Qdrant + PocketBase should AES-encrypt the user's data. | M | Oracle block storage is already encrypted; we don't add another layer. |
+| T3.7 | **Export / share a CoS answer** | Generate a public link to a redacted (memories stripped) conversation. | S | Easy to add later. |
+| T3.8 | **A formal eval harness with regression suite** | Run on every PR. Fails the build if any of 100+ golden questions regress. | L | Tier 1.4 is the MVP version (golden questions, not CI). |
+| T3.9 | **Per-agent cost budgets** | The CFO might consume 10x the tokens of the Memory agent. Show per-agent spend. | S | Easy. Out of MVP scope. |
+| T3.10 | **Multi-agent voting (for domain_internal conflicts)** | Today the CoS picks; tomorrow the C-suite could vote. | M | More tokens, slower turns. Defer until we see the CoS picking badly. |
+| T3.11 | **Audit log of every CoS decision** | "Why did the CoS recommend X?" | S | Log to PB. Add a "Why?" button to each assistant message that shows the trace. |
+
+### 12.4 My recommendation for what to ship next
+
+If I had to pick **three** to add on top of the swarm, in order:
+
+1. **T1.1 error handling + T1.2 rate limiting** — without these, the app will eventually break in production. They're a 2-hour job and unblock a real cloud deploy.
+2. **T1.4 golden-question eval harness** — 10-20 questions, run them after every prompt change. Catches regressions before the user does.
+3. **T2.2 cost observability** — once the swarm runs in production, the user will want to know what it costs. A small dashboard widget is the simplest sanity check.
+
+The rest (Python sandbox, formal CI eval, voice, etc.) are clearly v2.
+
+---
+
+## 14. Open questions for the user
 
 I made a few choices to keep the plan shippable. Flag any you want to change:
 
@@ -850,11 +906,12 @@ I made a few choices to keep the plan shippable. Flag any you want to change:
 - **`run_code` defaults**: 5 s timeout, 128 MB `--max-old-space-size` on the Next process. Bump these if specialists need longer runs (CFO scenario sims).
 - **Conflict strategy rubric**: I gave the CoS a 4-bucket rubric for picking `conflict_type`. If it picks `values_tradeoff` too often (annoying) or `technical_factual` too rarely (slow), we adjust the CoS prompt.
 - **Critic arbitration prompt**: a short suffix "Pick a winner. Justify with 2-3 sentences. Do not hedge." If the Critic still hedges, we make the prompt more aggressive or fall back to a hard-coded "if no clear winner, escalate to user".
+- **Tier 1 priorities for v1.1**: see section 12.4. My pick is error handling + rate limiting first, then a 10-20 question eval harness, then cost observability. Want me to bake those into the next iteration?
 - **Therapist scope**: still non-clinical with 988 redirect.
 
 ---
 
-## 13. Verification (V2 — 6 smoke tests)
+## 15. Verification (V2 — 6 smoke tests)
 
 The V1 plan had "send a message, get a TLDR". V2 covers all six new features:
 
