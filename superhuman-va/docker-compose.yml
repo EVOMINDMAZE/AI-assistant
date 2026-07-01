@@ -1,0 +1,88 @@
+name: superhuman-va
+
+services:
+  pocketbase:
+    image: ghcr.io/muchobien/pocketbase:v0.23.0
+    container_name: va-pocketbase
+    restart: unless-stopped
+    command: ["/pocketbase", "serve", "--http=0.0.0.0:8090"]
+    ports:
+      - "${PB_PORT:-8090}:8090"
+    volumes:
+      - pb_data:/pb_data
+    environment:
+      - PB_ADMIN_EMAIL=${PB_ADMIN_EMAIL}
+      - PB_ADMIN_PASSWORD=${PB_ADMIN_PASSWORD}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8090/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - va-net
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.0
+    container_name: va-qdrant
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - va-net
+
+  memory-service:
+    build:
+      context: ./memory-service
+      dockerfile: Dockerfile
+    container_name: va-memory-service
+    restart: unless-stopped
+    ports:
+      - "${MEMORY_PORT:-8000}:8000"
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - USER_ID=${USER_ID:-local-user}
+      - HF_HOME=${HF_HOME:-/app/.cache/huggingface}
+      - EMBED_MODEL=${EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+      - EMBED_DIMS=${EMBED_DIMS:-384}
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - POCKETBASE_URL=http://pocketbase:8090
+      - POCKETBASE_ADMIN_EMAIL=${PB_ADMIN_EMAIL}
+      - POCKETBASE_ADMIN_PASSWORD=${PB_ADMIN_PASSWORD}
+      - CORS_ORIGINS=http://localhost:${NEXT_PORT:-3000}
+    volumes:
+      - hf_cache:/app/.cache/huggingface
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      pocketbase:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - va-net
+
+volumes:
+  pb_data:
+  qdrant_storage:
+  hf_cache:
+
+networks:
+  va-net:
+    driver: bridge

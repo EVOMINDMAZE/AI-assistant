@@ -1,0 +1,34 @@
+# ── Node / Next.js ────────────────────────────────────
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# ── Python / memory-service ───────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# ── Local secrets ─────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+
+# ── Docker volumes (if mounted as bind, not named) ────
+qdrant_storage/
+pb_data/
+hf_cache/
+
+# ── OS / editor ───────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
