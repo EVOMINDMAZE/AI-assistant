@@ -31,9 +31,11 @@ export type SSEEvent =
   | { type: "error"; message: string }
   | { type: "done" };
 
-/** Names of all 12 registered specialists. */
+/** Names of the 12 consultable specialists. CoS is the user-facing hub
+ *  and is intentionally NOT included; it lives in
+ *  `specialists/chief-of-staff.ts` and is invoked by the chat route,
+ *  not by other agents via `consult_agent`. */
 export const AGENT_NAMES = [
-  "CoS",
   "Memory",
   "Document",
   "Researcher",

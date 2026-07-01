@@ -2,6 +2,14 @@
  * Specialist registry.
  *
  * Maps agent name → { agent, handoff, reasoning }.
+ *
+ * **CoS is intentionally NOT in this registry.** The Chief of Staff
+ * is the user-facing hub; it calls specialists via `consult_agent`,
+ * but no specialist ever calls CoS. Including CoS here would create
+ * a circular import (chief-of-staff.ts imports `importAgent` from
+ * this file, and this file would import `chiefOfStaff` from
+ * chief-of-staff.ts → TDZ when the chat route lazy-loads CoS).
+ *
  * Adding a new specialist is a 3-step recipe:
  *   1. Create specialists/<name>.ts exporting `agent` and `REASONING`.
  *   2. Import and register it here.
@@ -17,7 +25,6 @@ export interface RegistryEntry {
   description: string;
 }
 
-import { chiefOfStaff } from "./chief-of-staff";
 import { memoryAgent } from "./memory-agent";
 import { documentAgent } from "./document-agent";
 import { researcherAgent } from "./researcher";
@@ -32,7 +39,6 @@ import { fitnessCoachAgent } from "./fitness-coach";
 import { therapistAgent } from "./therapist";
 
 export const REGISTRY: Record<string, RegistryEntry> = {
-  CoS: { name: "CoS", agent: chiefOfStaff, reasoning: "think_high", description: "Chief of Staff (user-facing hub)" },
   Memory: { name: "Memory", agent: memoryAgent, reasoning: "non_think", description: "Cross-conversation memory specialist" },
   Document: { name: "Document", agent: documentAgent, reasoning: "non_think", description: "Document RAG specialist" },
   Researcher: { name: "Researcher", agent: researcherAgent, reasoning: "non_think", description: "Web search specialist" },
