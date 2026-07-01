@@ -17,7 +17,7 @@ USER ──► Chief of Staff (CoS, V4-Pro/Think-High) ──► [specialists, i
 
 The user **only ever talks to the CoS**. Specialists can also **talk to each other** through a shared, persisted message bus — not just through the CoS.
 
-**Four new requirements, now in scope (this revision):**
+**Four new requirements (round 1), now in scope:**
 
 | # | Requirement | Mechanism |
 |---|---|---|
@@ -25,6 +25,13 @@ The user **only ever talks to the CoS**. Specialists can also **talk to each oth
 | 2 | **Persistent agent state across turns** | New PB `agent_state` collection. CoS and specialists read at turn start, write at turn end. |
 | 3 | **Agent-to-agent messaging** | New PB `agent_messages` collection + `consult_agent(name, msg)` tool that any specialist can call. |
 | 4 | **DeepSeek V4 Pro for all agents** | `model = "deepseek-v4-pro"` everywhere. Per-agent `thinking` mode (Non-Think / Think High / Think Max). |
+
+**Two new requirements (round 2), also now in scope:**
+
+| # | Requirement | Mechanism |
+|---|---|---|
+| 5 | **Tool-use for code execution** | `node:vm`-sandboxed `compute(expr)` and `run_code(snippet)` tools available to CTO, CFO, and Planner. Python sandbox is a v2 follow-up. |
+| 6 | **Conflict resolution between specialists** | New `resolve_conflict(...)` tool. CoS picks the strategy: domain-internal → CoS decides; values/tradeoffs → escalate to the user via a `conflict` SSE event; technical/factual → Critic arbitrates (Think Max). |
 
 **Stack**: OpenAI Agents SDK (TypeScript) + DeepSeek V4 Pro + Tavily + Mem0 + Qdrant + PocketBase.
 
@@ -46,12 +53,12 @@ All agents use **DeepSeek V4 Pro** (`deepseek-v4-pro`). They differ only in **re
 | **Memory Agent** | Mem0 retrieval + writes. **Searches across all conversations** (not just current). | Non-Think | `search_memory`, `save_memory`, `promote_to_global` | When context is relevant |
 | **Document Agent** | Searches uploaded PDFs/notes in Qdrant. | Non-Think | `search_documents`, `list_documents` | When context is relevant |
 | **Researcher** | Live web search. | Non-Think | `web_search` (Tavily) | When current info needed |
-| **Planner** | Breaks complex tasks into steps. | Think High | `decompose_task` | For multi-step requests |
-| **Critic** | Reviews the final answer. | **Think Max** | `flag_issues` | Optional, for high-stakes |
-| **CTO** | Architecture, code, tech decisions. | Think High | `consult_agent` (so CTO can ping CSO about risk) | For tech questions |
-| **CFO** | Finance, budget, ROI, runway. | Think High | `consult_agent`, `compute_roi` | For finance questions |
+| **Planner** | Breaks complex tasks into steps. | Think High | `decompose_task`, `compute` | For multi-step requests |
+| **Critic** | Reviews the final answer. | **Think Max** | `flag_issues`, `arbitrate_conflict` (v2 — see 1.6) | Optional, for high-stakes |
+| **CTO** | Architecture, code, tech decisions. | Think High | `consult_agent` (so CTO can ping CSO about risk), `run_code`, `compute` | For tech questions |
+| **CFO** | Finance, budget, ROI, runway. | Think High | `consult_agent`, `compute`, `run_code` | For finance questions |
 | **CMO** | Marketing, growth, brand. | Think High | `consult_agent` | For marketing questions |
-| **CSO** | Security, compliance, risk. | Think High | `consult_agent` | For security questions |
+| **CSO** | Security, compliance, risk. | Think High | `consult_agent`, `run_code` (for proof-of-concept exploits / payloads) | For security questions |
 | **ADHD Coach** | Productivity, focus. | Non-Think | — | When user signals overwhelm |
 | **Fitness Coach** | Training, nutrition, recovery. | Non-Think | — | For health questions |
 | **Therapist** | Active listening, reflection, CBT-lite. | Non-Think | — | When user signals distress |
