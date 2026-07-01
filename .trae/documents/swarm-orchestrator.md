@@ -1,4 +1,4 @@
-# Subagent Swarm — Chief-of-Staff Architecture (V2)
+# Subagent Swarm — Chief-of-Staff Architecture (V2.1)
 
 ## TL;DR
 
@@ -12,7 +12,9 @@ USER ──► Chief of Staff (CoS, V4-Pro/Think-High) ──► [specialists, i
               ├── Recommends a clear next step
               ├── Remembers across conversations (Mem0 user-scope)
               ├── Holds working memory per conversation (PB agent_state)
-              └── Lets specialists consult each other directly (PB agent_messages)
+              ├── Lets specialists consult each other directly (PB agent_messages)
+              ├── Specialists can run sandboxed JS (node:vm)
+              └── Resolves specialist disagreements (3 strategies)
 ```
 
 The user **only ever talks to the CoS**. Specialists can also **talk to each other** through a shared, persisted message bus — not just through the CoS.
@@ -35,9 +37,9 @@ The user **only ever talks to the CoS**. Specialists can also **talk to each oth
 
 **Stack**: OpenAI Agents SDK (TypeScript) + DeepSeek V4 Pro + Tavily + Mem0 + Qdrant + PocketBase.
 
-**Ship order**: framework + DeepSeek V4-Pro adapter → state + messaging infra → CoS + 2 core agents → C-suite → life specialists → Researcher/Planner/Critic.
+**Ship order**: framework + DeepSeek V4-Pro adapter → state + messaging infra → code-exec sandbox → CoS + 2 core agents → C-suite → conflict resolution → life specialists → Researcher/Planner/Critic.
 
-**Files touched**: 2 new dirs, 7 new lib modules, 1 new API route, 1 new UI component, 1 PB bootstrap change, 2 small env edits. ~950 LOC. No new infrastructure.
+**Files touched**: 2 new dirs, 7 new lib modules, 1 new API route, 2 new UI components, 1 PB bootstrap change, 2 small env edits. ~1,100 LOC. No new infrastructure.
 
 ---
 
@@ -244,6 +246,83 @@ This section is the meat of V2. Each subsection maps to one of the four new requ
 
 ---
 
+#### 1.4.5 Tool-use for code execution (NEW — round 2)
+
+**Goal**: CTO, CFO, CSO, and Planner can actually run code — not just talk about it. Math, quick prototypes, payload simulations, scenario analysis.
+
+**Design**:
+
+- **Two tools**, both backed by the same sandbox:
+  - `compute(expression: string)` — fast, single-expression math. Returns a number or string. Used for ROI, NPV, runway calcs. < 200 ms typical.
+  - `run_code(snippet: string, language: "javascript")` — multi-line JS, returns stdout. Used for prototypes, simulations, payload demos. 5-second timeout default.
+- **Sandbox**: `node:vm` with a fresh `vm.createContext` per call. No `require`, no `globalThis.process`, no `fetch`, no `fs`. A curated `safeGlobals` object exposes only: `Math`, `Date`, `JSON`, `console.log` (captured into stdout), `Array`, `Object`, `String`, `Number`, `Boolean`.
+- **Resource limits** (set via `vm.Script` + a watchdog timer):
+  - Wall clock: 5 s default; 30 s hard cap.
+  - Memory: rely on V8's default heap; for stricter control we can set `--max-old-space-size=128` on the Node process (already small in the docker image). For the MVP this is good enough; a v2 follow-up adds `isolated-vm` for true per-call memory caps.
+  - No network, no filesystem, no child processes — node:vm enforces this naturally because the context has no `require` and no Node primitives.
+- **Cost control**: `compute` is cheap; `run_code` adds latency. The CTO and CFO prompts guide them to prefer `compute` for math. A `RunContext.max_run_code_calls` (default 3) per turn caps abuse.
+- **What CSO can do with it**: red-team a payload, simulate a brute-force timing, parse a JWT to demonstrate a vulnerability. All sandboxed. The user's existing CSO prompt already frames this as advisory — `run_code` is a teaching tool, not an attack tool.
+- **What about Python?** Out of scope for v1. The sandbox is JS-only. A v2 follow-up could embed Pyodide (~10 MB cold start) or run a separate Python worker in Docker with `docker exec` + seccomp.
+
+**Why not a separate worker process?** `node:vm` is enough for the math + small-script use case, and it adds zero new infrastructure. We're already running Node. If a specialist needs real Python (e.g. data analysis on a CSV), we add a worker in v2.
+
+**File: [next-app/lib/agents/tools/code-exec.ts](file:///workspace/superhuman-va/next-app/lib/agents/tools/code-exec.ts)** — new file. Defines `compute` and `run_code` tools. The `run_code` handler:
+  1. Wraps the snippet in `(function() { "use strict"; ${snippet} })()`.
+  2. Creates a fresh `vm.Context` with safe globals.
+  3. Compiles a `vm.Script` with a 5-second timeout.
+  4. Captures `console.log` calls into an in-memory buffer.
+  5. Returns `{ stdout, value, error }`.
+  6. Catches any `Script execution timed out` and returns a friendly error.
+
+**Wire-up**: import in [cto.ts](file:///workspace/superhuman-va/next-app/lib/agents/specialists/cto.ts), [cfo.ts](file:///workspace/superhuman-va/next-app/lib/agents/specialists/cfo.ts), [cso.ts](file:///workspace/superhuman-va/next-app/lib/agents/specialists/cso.ts), [planner.ts](file:///workspace/superhuman-va/next-app/lib/agents/specialists/planner.ts).
+
+---
+
+#### 1.4.6 Conflict resolution between specialists (NEW — round 2)
+
+**Goal**: when two specialists disagree, the CoS resolves it deterministically — not by ignoring the disagreement and not by picking whichever it saw first.
+
+**Design**:
+
+- **The `resolve_conflict` tool** (available only to the CoS):
+  ```ts
+  resolve_conflict({
+    question: string,
+    positions: z.array(z.object({
+      agent: z.string(),
+      stance: z.string(),       // one-sentence summary
+      reasoning: z.string(),    // 2-3 sentence defense
+    })).min(2),
+    conflict_type: z.enum(["domain_internal", "values_tradeoff", "technical_factual"]),
+  })
+  ```
+- **Three strategies**, picked by `conflict_type`:
+  1. **`domain_internal`** — one specialist clearly owns the question (e.g. CFO says "$5k/month" and CMO says "we should spend $50k/month on ads"). The CoS **decides** in its own turn using the `CoS` reasoning. Returns the winning position + a one-sentence justification. The Team Panel shows it as "CoS ruled: ...".
+  2. **`values_tradeoff`** — the disagreement is about what the *user* wants (e.g. ADHD Coach says "do it now" + CFO says "sleep on it"). The CoS **escalates to the user**. The tool:
+     - Emits a special SSE event `conflict` with `{ question, options: [...], recommendation }`.
+     - Pauses the CoS's stream (close it, do not finalize the answer).
+     - Returns a synthetic "user will pick" marker; the CoS's next turn (after the user clicks) continues.
+     - The Team Panel renders a `ConflictCard` component with the options and a "Pick" button per option.
+  3. **`technical_factual`** — the disagreement is about a fact or a technical claim (e.g. CTO says "Postgres scales to 100 TB" and CSO says "Postgres caps at 50 TB"). The CoS **delegates to the Critic in arbitration mode** (Think Max, with a specific arbitration prompt). Returns the Critic's verdict + reasoning. Team Panel shows "Critic arbitrated: ...".
+- **How the CoS picks the `conflict_type`**: this is the hard part. We don't expect the CoS to always get it right. The CoS's prompt gets a rubric:
+  - If both specialists' answers are about the **same metric or fact** → `technical_factual`.
+  - If both specialists' answers are **recommendations that depend on user priorities** → `values_tradeoff`.
+  - If one specialist is **clearly out of their lane** (e.g. CFO answering a marketing question) → `domain_internal`.
+  - If unsure → `values_tradeoff` (escalate; the cost of asking is low).
+- **Critic arbitration mode**: when the CoS calls `consult_agent("Critic", <arbitration-prompt>)`, the consult.ts tool uses a different `REASONING` for the Critic (forces Think Max) and a different system prompt suffix: "You are arbitrating a conflict between two specialists. Pick a winner. Justify with 2-3 sentences. Do not hedge." The Critic's regular `flag_issues` tool is not available in this mode.
+- **State persistence**: each resolved conflict is recorded as an `agent_message` row with `to_agent = "ConflictResolution"` (or a dedicated `to_agent` value like `"__conflict__"`). Visible in the Team Panel history.
+- **Cost**: domain_internal is free (CoS reasons). values_tradeoff pauses the stream — net cost ≈ 0 until the user replies. technical_factual adds one Critic call (Think Max, expensive but bounded). Worst case a turn costs 1×CoS + 1×Critic.
+
+**File: [next-app/lib/agents/tools/resolve-conflict.ts](file:///workspace/superhuman-va/next-app/lib/agents/tools/resolve-conflict.ts)** — new file. Defines the `resolve_conflict` tool. Imports the Critic via the registry for the `technical_factual` path. Emits the `conflict` SSE event for the `values_tradeoff` path.
+
+**File: [next-app/components/conflict-card.tsx](file:///workspace/superhuman-va/next-app/components/conflict-card.tsx)** — new file. Renders the picker UI for the `values_tradeoff` case. Posts the user's choice back to `/api/chat` as a synthetic message.
+
+**File: [next-app/app/api/chat/route.ts](file:///workspace/superhuman-va/next-app/app/api/chat/route.ts)** — handle a new request shape: `{ kind: "conflict_resolution", conflictId, choice }` in addition to the regular `{ message, conversationId, userId }` shape. The handler loads the paused turn's state, injects the user's choice as a synthetic user message, and resumes the CoS stream.
+
+**Wire-up**: `resolve_conflict` is added only to the CoS agent's tool list (no other specialist needs it). `arbitrate_conflict` is a thin re-export of the Critic with a forced prompt suffix; it lives in the same `resolve-conflict.ts` file.
+
+---
+
 ## 2. Framework setup
 
 ### 2.1 Add the OpenAI Agents SDK
@@ -336,6 +415,8 @@ The SDK defines tools as Zod schemas + async handlers. We centralise tool factor
 | [next-app/lib/agents/tools/visualize.ts](file:///workspace/superhuman-va/next-app/lib/agents/tools/visualize.ts) | `render_visual({type, data})` → Markdown / Mermaid string. |
 | [next-app/lib/agents/tools/state.ts](file:///workspace/superhuman-va/next-app/lib/agents/tools/state.ts) | `load_my_state`, `save_my_state` (1.4.2). |
 | [next-app/lib/agents/tools/consult.ts](file:///workspace/superhuman-va/next-app/lib/agents/tools/consult.ts) | `consult_agent(name, message)` (1.4.3). This tool is the *bridge* between specialists. |
+| [next-app/lib/agents/tools/code-exec.ts](file:///workspace/superhuman-va/next-app/lib/agents/tools/code-exec.ts) | `compute(expr)` + `run_code(snippet)` via `node:vm` (1.4.5). |
+| [next-app/lib/agents/tools/resolve-conflict.ts](file:///workspace/superhuman-va/next-app/lib/agents/tools/resolve-conflict.ts) | `resolve_conflict(...)` for the CoS (1.4.6). |
 
 ---
 
@@ -374,20 +455,20 @@ export const ctoHandoff = ctoAgent.asHandoffTool({
 
 | File | Agent | Reasoning | Tools |
 |---|---|---|---|
-| `chief-of-staff.ts` | **CoS** | Think High | `consult_specialist` (handoff to all), `consult_agent`, `visualize`, `load_my_state`, `save_my_state`, `list_global_facts` |
+| `chief-of-staff.ts` | **CoS** | Think High | `consult_specialist` (handoff to all), `consult_agent`, `visualize`, `load_my_state`, `save_my_state`, `list_global_facts`, **`resolve_conflict`** |
 | `memory-agent.ts` | Memory | Non-Think | `search_memory`, `search_global_memory`, `add_memory`, `add_global_memory`, `promote_to_global` |
 | `document-agent.ts` | Document | Non-Think | `search_documents`, `list_documents` |
 | `researcher.ts` | Web | Non-Think | `tavily.search` |
-| `planner.ts` | Planner | Think High | `decompose` |
-| `critic.ts` | Critic | **Think Max** | `flag_issues` |
-| `cto.ts` | CTO | Think High | `consult_agent` |
-| `cfo.ts` | CFO | Think High | `consult_agent`, `compute_roi` |
+| `planner.ts` | Planner | Think High | `decompose`, `compute`, `run_code` |
+| `critic.ts` | Critic | **Think Max** | `flag_issues` (+ arbitration mode invoked via `consult_agent` from CoS) |
+| `cto.ts` | CTO | Think High | `consult_agent`, `compute`, `run_code` |
+| `cfo.ts` | CFO | Think High | `consult_agent`, `compute`, `run_code` |
 | `cmo.ts` | CMO | Think High | `consult_agent` |
-| `cso.ts` | CSO | Think High | `consult_agent` |
+| `cso.ts` | CSO | Think High | `consult_agent`, `run_code` (for PoC exploits / payload analysis) |
 | `adhd-coach.ts` | ADHD | Non-Think | — |
 | `fitness-coach.ts` | Fitness | Non-Think | — |
 | `therapist.ts` | Therapist | Non-Think | — |
-| `registry.ts` | — | — | Maps agent name → handoff + reasoning mode |
+| `registry.ts` | — | — | Maps agent name → handoff + reasoning mode + arbitration prompt |
 
 ### 3.3 The CoS prompt (V2 — explicitly cross-conversation, stateful, A2A-aware)
 
@@ -412,6 +493,14 @@ structured answer for the user.
 - Agent-to-agent: any specialist you delegate to can in turn delegate to
   another specialist via consult_agent(). You will see the chain in the
   team panel. You only re-engage when the chain has produced enough.
+
+- Conflicts: when two specialists disagree, do NOT silently pick one or
+  blend their positions. Call resolve_conflict(...) and pass the conflict
+  type:
+    * same metric / fact being disputed       → conflict_type="technical_factual"
+    * recommendations that depend on priorities → conflict_type="values_tradeoff"
+    * one specialist is out of their lane      → conflict_type="domain_internal"
+    * unsure                                  → conflict_type="values_tradeoff"
 
 # Response format
 
@@ -461,16 +550,19 @@ The CoS system prompt is constructed by chat/route.ts by templating this skeleto
 V2 adds one line per specialist that tells it *when* to use `consult_agent`:
 
 **CTO**
-> You are the CTO. Architecture, code, technical decisions. Be decisive. Give one recommendation, with reasoning. Use code blocks. You are not a teacher; you are a peer. **If a question touches security, compliance, or risk, call `consult_agent("CSO", <your question>)` before answering.**
+> You are the CTO. Architecture, code, technical decisions. Be decisive. Give one recommendation, with reasoning. Use code blocks. You are not a teacher; you are a peer. **If a question touches security, compliance, or risk, call `consult_agent("CSO", <your question>)` before answering.** **For math, always prefer `compute(expr)` over estimating in prose.** **For prototypes / data-shape sketches, use `run_code(snippet)` and show the output.**
 
 **CFO**
-> You are the CFO. Finance, budgeting, ROI, runway, unit economics. Be quantitatively precise. Never make up numbers. Use tables. **For cost-of-engineering questions, call `consult_agent("CTO", <your question>)` first to ground the estimate.**
+> You are the CFO. Finance, budgeting, ROI, runway, unit economics. Be quantitatively precise. Never make up numbers. Use tables. **For cost-of-engineering questions, call `consult_agent("CTO", <your question>)` first to ground the estimate.** **Use `compute` for every numeric claim. Use `run_code` for multi-year scenario simulations.**
 
 **CMO**
 > You are the CMO. Marketing, growth, brand, positioning. Speak in funnels, conversion, positioning. **For questions about product capabilities or roadmap, call `consult_agent("CTO", <your question>)`.**
 
 **CSO**
-> You are the CSO. Security, compliance, risk. Think in threat models. Worst case first, then mitigation, then residual risk. **For financial impact of a security event, call `consult_agent("CFO", <your question>)`.**
+> You are the CSO. Security, compliance, risk. Think in threat models. Worst case first, then mitigation, then residual risk. **For financial impact of a security event, call `consult_agent("CFO", <your question>)`.** **Use `run_code` to demonstrate exploits / parse a JWT / time a brute-force in a sandboxed snippet. Never propose exploits against systems you don't own.**
+
+**Planner**
+> You are the Planner. You take a complex task and break it into ordered, time-boxed sub-steps. You are decisive: 3-7 steps, not 30. **Use `compute` for any time / cost estimate. Use `run_code` to validate a step's preconditions (e.g. file size, API quota).**
 
 **ADHD Coach**
 > You are an ADHD coach. Smallest possible next step, time-box, lower activation energy. Never say "just focus". Suggest environment changes, body doubling, timers, reward pairing. **Save your recommendations to your state with `save_my_state` so we don't lose them next turn.**
@@ -543,8 +635,11 @@ export async function POST(req: NextRequest) {
 | `raw_model_stream_event` (text delta) | `token` | Append to assistant bubble |
 | `run_item_stream_event` (tool_call) | `tool_start` | Add to TeamPanel |
 | `run_item_stream_event` (tool_result) | `tool_done` | Add specialist's output to TeamPanel |
+| `run_item_stream_event` (`run_code`/`compute`) | `code_run` | TeamPanel shows "CTO ran: `for (let i=0;...)`" + output |
 | `agent_updated_stream_event` (handoff) | `handoff` | TeamPanel shows specialist took over |
 | `consult_agent` tool_call | `agent_message` | TeamPanel shows specialist → specialist exchange |
+| `resolve_conflict` tool_call (values_tradeoff) | `conflict` | TeamPanel renders `ConflictCard` with options; stream pauses |
+| `resolve_conflict` tool_call (domain_internal / technical_factual) | `conflict_resolved` | TeamPanel shows "CoS ruled: X" or "Critic arbitrated: Y" |
 | final message | `done` | Close stream |
 | start | `meta` | Send `conversationId`, `turnId` |
 
@@ -663,6 +758,8 @@ That's it. The CoS will start routing relevant questions to it, and the new agen
 | `next-app/lib/agents/tools/visualize.ts` | Mermaid/table renderer |
 | `next-app/lib/agents/tools/state.ts` | `load_my_state`, `save_my_state` (1.4.2) |
 | `next-app/lib/agents/tools/consult.ts` | `consult_agent` (1.4.3) — the A2A bridge |
+| `next-app/lib/agents/tools/code-exec.ts` | `compute` + `run_code` via `node:vm` (1.4.5) |
+| `next-app/lib/agents/tools/resolve-conflict.ts` | `resolve_conflict` for the CoS (1.4.6) — domain / values / technical arbitration |
 | `next-app/lib/state.ts` | PB wrappers for `agent_state` collection |
 | `next-app/lib/messaging.ts` | PB wrappers for `agent_messages` collection |
 | `next-app/lib/agents/specialists/chief-of-staff.ts` | The CoS agent |
@@ -670,16 +767,17 @@ That's it. The CoS will start routing relevant questions to it, and the new agen
 | `next-app/lib/agents/specialists/document-agent.ts` | Document specialist |
 | `next-app/lib/agents/specialists/researcher.ts` | Web researcher |
 | `next-app/lib/agents/specialists/planner.ts` | Task planner |
-| `next-app/lib/agents/specialists/critic.ts` | Reviewer (Think Max) |
-| `next-app/lib/agents/specialists/cto.ts` | CTO |
-| `next-app/lib/agents/specialists/cfo.ts` | CFO |
+| `next-app/lib/agents/specialists/critic.ts` | Reviewer (Think Max) + arbitration prompt |
+| `next-app/lib/agents/specialists/cto.ts` | CTO (with `compute` + `run_code`) |
+| `next-app/lib/agents/specialists/cfo.ts` | CFO (with `compute` + `run_code`) |
 | `next-app/lib/agents/specialists/cmo.ts` | CMO |
-| `next-app/lib/agents/specialists/cso.ts` | CSO |
+| `next-app/lib/agents/specialists/cso.ts` | CSO (with `run_code` for PoC) |
 | `next-app/lib/agents/specialists/adhd-coach.ts` | ADHD coach |
 | `next-app/lib/agents/specialists/fitness-coach.ts` | Fitness coach |
 | `next-app/lib/agents/specialists/therapist.ts` | Therapist |
-| `next-app/lib/agents/specialists/registry.ts` | Agent → handoff + reasoning-mode registry |
-| `next-app/components/team-panel.tsx` | Live activity UI (with A2A events) |
+| `next-app/lib/agents/specialists/registry.ts` | Agent → handoff + reasoning mode + arbitration prompt |
+| `next-app/components/team-panel.tsx` | Live activity UI (with A2A + conflict events) |
+| `next-app/components/conflict-card.tsx` | Picker UI for `values_tradeoff` conflicts (1.4.6) |
 | `memory-service/app/routes/memories.py` (edit) | Add `/add_global_memory`, `/search_global_memory`, `/list_global_memory` |
 
 **Edited files (6):**
@@ -689,15 +787,15 @@ That's it. The CoS will start routing relevant questions to it, and the new agen
 | `next-app/package.json` | Add `@openai/agents` + `tavily` |
 | `next-app/.env.local.example` | `DEEPSEEK_MODEL=deepseek-v4-pro` + `TAVILY_API_KEY` |
 | `next-app/lib/deepseek.ts` | Default model → `deepseek-v4-pro` |
-| `next-app/app/api/chat/route.ts` | Rewrite to use CoS + V2 context load |
-| `next-app/app/chat/page.tsx` | Add Team Panel drawer + new SSE event types |
+| `next-app/app/api/chat/route.ts` | Rewrite to use CoS + V2 context load + `conflict_resolution` resume |
+| `next-app/app/chat/page.tsx` | Add Team Panel drawer + ConflictCard + new SSE event types |
 | `memory-service/app/config.py` | Default model → `deepseek-v4-pro` |
 | `memory-service/app/qdrant_client.py` | Add `memories_global` collection |
 | `memory-service/scripts/pb_bootstrap.py` | Add `agent_state` + `agent_messages` collections |
 
 **No changes** to: `docker-compose.yml`, `caddy/`, `next-app/Dockerfile`, `next-app/components/ui/`, or the shadcn primitives.
 
-Total: ~25 new files, 8 edits, ~950 LOC.
+Total: ~26 new files, 8 edits, ~1,100 LOC.
 
 ---
 
@@ -709,27 +807,31 @@ Total: ~25 new files, 8 edits, ~950 LOC.
 | 2 | `pb_bootstrap.py` adds `agent_state` + `agent_messages` collections; `state.ts` + `messaging.ts` + their PB wrappers | State + messaging are dependencies for every agent. |
 | 3 | Mem0 global pool: `memory.py` adds global methods; `qdrant_client.py` adds the collection; `routes/memories.py` adds 3 endpoints; `mem0.ts` tools gain the new methods | Unblocks the Memory agent. |
 | 4 | `state.ts` and `consult.ts` tools; `consult_agent` works against a stub target | Validates the A2A bus with one consumer. |
-| 5 | CoS + Memory + Document agents, wire into `chat/route.ts` with V2 context load | First end-to-end swarm demo. |
-| 6 | Team Panel UI with A2A event rendering | User can see the swarm working. |
-| 7 | C-suite (CTO/CFO/CMO/CSO) — 4 files; each gets `consult_agent` for cross-domain | Cross-domain reasoning comes alive. |
-| 8 | Life specialists (ADHD/Fitness/Therapist) — 3 files | Warmer, slower conversations. |
-| 9 | Tavily + Researcher agent | Adds live info. |
-| 10 | Planner + Critic (with cost-control heuristics) | Production-quality pass. |
-| 11 | Verification: cross-conversation smoke test, state persistence smoke test, A2A smoke test | Sign-off. |
+| 5 | `code-exec.ts` — `compute` + `run_code` via `node:vm`. Test with a tiny `let sum = 1+1; sum` snippet. | Unblocks the math/runnable-code needs of CTO/CFO/CSO/Planner. |
+| 6 | CoS + Memory + Document agents, wire into `chat/route.ts` with V2 context load | First end-to-end swarm demo. |
+| 7 | Team Panel UI with A2A event rendering | User can see the swarm working. |
+| 8 | C-suite (CTO/CFO/CMO/CSO) — 4 files; each gets `consult_agent` + `compute`/`run_code` where useful | Cross-domain reasoning comes alive. |
+| 9 | Life specialists (ADHD/Fitness/Therapist) — 3 files | Warmer, slower conversations. |
+| 10 | `resolve-conflict.ts` + `conflict-card.tsx` + the new SSE event types; extend `chat/route.ts` to resume paused turns. | Adds the conflict-resolution paths (domain / values / technical). |
+| 11 | Tavily + Researcher agent | Adds live info. |
+| 12 | Planner + Critic (with cost-control heuristics) + arbitration mode | Production-quality pass. |
+| 13 | Verification: cross-conversation smoke test, state persistence smoke test, A2A smoke test, code-exec smoke test, conflict-resolution smoke test | Sign-off. |
 
 ---
 
 ## 11. What this plan does NOT include (V2)
 
-We removed four items from V1's exclusion list (cross-conversation memory, persistent state, agent-to-agent messaging, V4 Pro) — they're all in scope now. The remaining non-goals:
+We removed six items from V1's exclusion list (cross-conversation memory, persistent state, agent-to-agent messaging, V4 Pro, code execution, conflict resolution) — they're all in scope now. The remaining non-goals:
 
 - ❌ Multi-user auth (still single-user)
-- ❌ Tool-use for code execution (CTO can recommend code, but can't run it in v1)
 - ❌ Voice input/output
 - ❌ Per-conversation model selection (all use V4 Pro; reasoning mode is the only dial)
 - ❌ A formal eval harness (we have a smoke test, not a regression suite)
-- ❌ Conflict resolution when two specialists disagree (CoS picks one based on expertise, no voting)
-- ❌ Cost budgets per agent (only a global `max_agent_consults` per turn)
+- ❌ Cost budgets per agent (only a global `max_agent_consults` and `max_run_code_calls` per turn)
+- ❌ Python sandbox (JS via `node:vm` only — see 1.4.5)
+- ❌ True per-call memory caps (no `isolated-vm` — V8 heap limit is best-effort)
+- ❌ Multi-agent voting (CoS decides domain_internal; Critic arbitrates technical_factual; user decides values_tradeoff)
+- ❌ Persistent audit log of every CoS decision (we log to console only; Ship v2 if needed)
 
 Each of these is a follow-up. None blocks the demo.
 
@@ -744,14 +846,17 @@ I made a few choices to keep the plan shippable. Flag any you want to change:
 - **A2A loop guard**: default max depth 3, max consults per turn 4. If you have long chains (e.g. CMO → CTO → CSO → CFO → CTO), bump these.
 - **`consult_agent` cost**: each consult is an extra LLM round-trip. A 4-consult turn with V4 Pro is roughly 5× a baseline turn in tokens. If cost matters more than depth, we can collapse some A2A flows back to "CoS relays the question" (V1 style).
 - **Tavily**: still the default. Alternatives: Serper (Google SERP) or Bing.
-- **CFO/CTO tools**: still no real code execution. CFO computes via a Zod-validated math tool only.
+- **`node:vm` vs `isolated-vm`**: `node:vm` is built-in but has weaker memory caps. If a user tries to OOM the worker, V8 will kill the whole Next.js process. `isolated-vm` (~30 MB native dep) gives true per-call caps. Default to `node:vm`; switch to `isolated-vm` if we hit any crashes.
+- **`run_code` defaults**: 5 s timeout, 128 MB `--max-old-space-size` on the Next process. Bump these if specialists need longer runs (CFO scenario sims).
+- **Conflict strategy rubric**: I gave the CoS a 4-bucket rubric for picking `conflict_type`. If it picks `values_tradeoff` too often (annoying) or `technical_factual` too rarely (slow), we adjust the CoS prompt.
+- **Critic arbitration prompt**: a short suffix "Pick a winner. Justify with 2-3 sentences. Do not hedge." If the Critic still hedges, we make the prompt more aggressive or fall back to a hard-coded "if no clear winner, escalate to user".
 - **Therapist scope**: still non-clinical with 988 redirect.
 
 ---
 
-## 13. Verification (V2 adds 4 new smoke tests)
+## 13. Verification (V2 — 6 smoke tests)
 
-The V1 plan had "send a message, get a TLDR". V2 adds:
+The V1 plan had "send a message, get a TLDR". V2 covers all six new features:
 
 | Test | How to verify | Pass criteria |
 |---|---|---|
@@ -760,5 +865,8 @@ The V1 plan had "send a message, get a TLDR". V2 adds:
 | **Agent-to-agent messaging** | "I'm thinking of building a new fintech app and putting it on a public S3 bucket — should I?" | Team panel shows CTO → CSO. CSO's reply mentions threat model, not just generic security. CoS's answer cites both. |
 | **V4 Pro** | `curl -s $DEEPSEEK_BASE_URL/v1/models -H "Authorization: Bearer $DEEPSEEK_API_KEY" \| jq` | `deepseek-v4-pro` is in the model list. Inspect chat logs: every `chat.completions.create` call uses `model: "deepseek-v4-pro"`. |
 | **Reasoning mode** | Ask the CoS a hard, multi-step question. Then ask the Critic to review it. | Token counts differ by ~2-4× between Think High and Think Max. Logs show `thinking: { mode: "think_max" }` for the Critic. |
+| **Code execution** | "If I invest $10k at 7% for 30 years, what's it worth?" | Team panel shows "CFO ran: `Math.pow(1.07, 30) * 10000`" → output `76122.55…`. No `require` / `process` / `fetch` access. A snippet with `while(true){}` is killed in ≤5 s. |
+| **Conflict resolution** | "Should I deploy on Friday at 5pm or Monday at 9am?" (or any question where CTO and CFO disagree) | Team panel shows a `conflict` event + a `ConflictCard` with the two options. User picks one. CoS resumes the turn and writes the final answer citing the chosen option. |
+| **Critic arbitration** | Force a technical factual dispute: ask a question that triggers CTO and CSO to disagree on a number. | Team panel shows `conflict_resolved` with `Critic arbitrated: …`. Logs show the Critic was invoked with the arbitration prompt suffix. |
 
-End state: a real team of 12+ agents, one Chief of Staff on the front line, V4 Pro for every brain, with shared memory, working state, and a chat channel between specialists.
+End state: a real team of 12+ agents, one Chief of Staff on the front line, V4 Pro for every brain, with shared memory, working state, a chat channel between specialists, runnable code, and a deterministic way to resolve disagreements.
