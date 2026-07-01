@@ -23,7 +23,7 @@
 import "server-only";
 import { NextRequest } from "next/server";
 import { ulid } from "ulid";
-import { getResponseSync } from "@/lib/agents/model";
+import { runAgentDirect } from "@/lib/agents/direct-runner";
 import { memoryClient } from "@/lib/memory-client";
 import { createAdminSupabase } from "@/lib/supabase/admin";
 import { createServerSupabase } from "@/lib/supabase/server";
@@ -33,7 +33,7 @@ import type { ChatMessage } from "@/lib/types";
 import type { CosState, SSEEvent } from "@/lib/agent-types";
 
 export const runtime = "nodejs";
-export const maxDuration = 60; // Vercel Pro
+export const maxDuration = 300; // Vercel Pro max — long enough for CoS → Researcher (Tavily) chains
 export const dynamic = "force-dynamic";
 
 // ─── Auth helper ──────────────────────────────────────────────────────────
@@ -332,21 +332,27 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        // Non-streaming path. We use `getResponseSync` (the watchdog fallback
-        // from fix-top3-broken) for both happy and error paths. This means
-        // the assistant response arrives as a single token event rather
-        // than word-by-word, but it's reliable across SDK versions. A
-        // future PR can re-introduce streaming once we pin a stable
-        // @openai/agents API.
-        const result = await getResponseSync(chiefOfStaff, inputItems, {
-          conversationId,
-          userId,
-          turnId,
-          reasoning: "think_high",
-          fromAgent: "CoS",
-          a2aDepth: 0,
-          a2aConsultsThisTurn: 0,
-        } as any);
+        // Non-streaming path. We use `runAgentDirect` (bypass of the
+        // @openai/agents Runner — see lib/agents/direct-runner.ts) for
+        // both happy and error paths. This means the assistant response
+        // arrives as a single token event rather than word-by-word, but
+        // it's reliable across SDK versions and routes every call through
+        // DeepSeek. A future PR can re-introduce streaming by replacing
+        // `runAgentDirect` with a streaming variant that yields tokens
+        // incrementally.
+        const result = await runAgentDirect({
+          agent: chiefOfStaff,
+          input: inputItems,
+          ctx: {
+            conversationId,
+            userId,
+            turnId,
+            reasoning: "think_high",
+            fromAgent: "CoS",
+            a2aDepth: 0,
+            a2aConsultsThisTurn: 0,
+          },
+        });
         assistantBuffer = result.text;
         if (assistantBuffer) {
           const t: SSEEvent = { type: "token", delta: assistantBuffer };
@@ -577,15 +583,19 @@ async function handleConflictResolution(body: any, userId: string): Promise<Resp
       let assistantBuffer = "";
       try {
         const { chiefOfStaff } = await import("@/lib/agents/specialists/chief-of-staff");
-        const result = await getResponseSync(chiefOfStaff, followUp, {
-          conversationId,
-          userId,
-          turnId,
-          reasoning: "think_high",
-          fromAgent: "CoS",
-          a2aDepth: 0,
-          a2aConsultsThisTurn: 0,
-        } as any);
+        const result = await runAgentDirect({
+          agent: chiefOfStaff,
+          input: followUp,
+          ctx: {
+            conversationId,
+            userId,
+            turnId,
+            reasoning: "think_high",
+            fromAgent: "CoS",
+            a2aDepth: 0,
+            a2aConsultsThisTurn: 0,
+          },
+        });
         assistantBuffer = result.text;
         if (assistantBuffer) {
           const t: SSEEvent = { type: "token", delta: assistantBuffer };

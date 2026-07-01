@@ -1,30 +1,19 @@
 /**
- * tests/stream-fallback.test.ts — verifies the 2-second watchdog in the
- * chat route. We mock the OpenAI Agents SDK so the test does not require a
- * live DeepSeek connection.
+ * tests/stream-fallback.test.ts — verifies the chat route finishes
+ * (emits a `done` or `error` event) end-to-end. We mock the auth,
+ * the memory client, and the LLM runner so the test does not require
+ * a live Supabase or DeepSeek connection.
  */
 import { describe, it, expect, vi } from "vitest";
 
-// Mock the @openai/agents SDK before importing the route
-vi.mock("@openai/agents", () => {
+// Mock the LLM runner (replaces the @openai/agents Runner path).
+vi.mock("@/lib/agents/direct-runner", () => {
   return {
-    Runner: class {
-      runStreamed = vi.fn().mockImplementation(() => {
-        // Return an async iterable that yields no events
-        return {
-          [Symbol.asyncIterator]() {
-            return {
-              async next() {
-                return { value: undefined, done: true };
-              },
-            };
-          },
-        };
-      });
-    },
-    Agent: class {
-      constructor(_cfg: any) {}
-    },
+    runAgentDirect: vi.fn().mockResolvedValue({
+      text: "stub reply from runAgentDirect",
+      usage: { input: 1, output: 1, reasoning: 0, estimated: false },
+      toolCalls: [],
+    }),
   };
 });
 
@@ -41,6 +30,17 @@ vi.mock("@/lib/memory-client", () => ({
     addMemory: vi.fn().mockResolvedValue({}),
     indexMessage: vi.fn().mockResolvedValue({}),
   },
+}));
+
+vi.mock("@/lib/supabase/server", () => ({
+  createServerSupabase: () => ({
+    auth: {
+      getUser: vi.fn().mockResolvedValue({
+        data: { user: { id: "test-user-id" } },
+        error: null,
+      }),
+    },
+  }),
 }));
 
 vi.mock("@/lib/supabase/admin", () => ({
@@ -93,8 +93,9 @@ describe("stream fallback", () => {
     // seconds and emits at least one `done` event.
     const start = Date.now();
     const res = await POST(
-      makeReq({ userId: "test", message: "tell me a short story" })
+      makeReq({ message: "tell me a short story" })
     );
+    expect(res.status).toBe(200);
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = "";

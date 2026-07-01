@@ -2,9 +2,13 @@
  * Agent-to-agent consult tool.
  *
  * Any specialist can call `consult_agent(name, message)` to invoke another
- * specialist via the OpenAI Agents SDK Runner. The tool:
+ * specialist via DeepSeek directly (bypassing the OpenAI Agents SDK
+ * Runner, which is incompatible with our DeepSeek adapter in v0.3.x).
+ * The tool:
  *   1. Inserts a row in `agent_messages` with status=pending.
- *   2. Invokes the target agent (looked up from the registry).
+ *   2. Invokes the target agent (looked up from the registry) via
+ *      `runAgentDirect`, which calls DeepSeek's chat completions API
+ *      and handles the tool-call loop.
  *   3. Updates the row with the reply (status=replied).
  *   4. Enforces a 3-deep loop guard and a 4-consult/turn budget.
  */
@@ -12,8 +16,8 @@ import "server-only";
 import { tool } from "@openai/agents";
 import { z } from "zod";
 import { ulid } from "ulid";
-import { Runner } from "@openai/agents";
-import { deepseekModel, type ReasoningMode } from "@/lib/agents/model";
+import { runAgentDirect } from "@/lib/agents/direct-runner";
+import { type ReasoningMode } from "@/lib/agents/model";
 import {
   postMessage,
   markReplied,
@@ -80,19 +84,17 @@ export function getConsultTool(importAgent: (name: string) => Promise<any>) {
       // ── Invoke the target agent ──
       try {
         const target = await importAgent(agent_name);
-        const runner = new Runner({ model: deepseekModel });
-        const result = await runner.run(target, message, {
-          context: {
+        const result = await runAgentDirect({
+          agent: target,
+          input: message,
+          ctx: {
             ...ctx,
             a2aDepth: (ctx.a2aDepth ?? 0) + 1,
             a2aConsultsThisTurn: (ctx.a2aConsultsThisTurn ?? 0) + 1,
             fromAgent: agent_name,
           },
         });
-        const reply =
-          typeof (result as any).finalOutput === "string"
-            ? (result as any).finalOutput
-            : JSON.stringify((result as any).finalOutput ?? "");
+        const reply = result.text || "";
         await markReplied(row.id, reply);
         return { agent: agent_name, reply };
       } catch (err: any) {
