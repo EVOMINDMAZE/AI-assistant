@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .memory import MemoryService
-from .qdrant_client import DocumentStore
+from .qdrant_client import DocumentStore, GlobalMemoryStore, MessageStore
 from .routes import documents as documents_routes
 from .routes import memories as memories_routes
 from .schemas import StatusResponse
@@ -38,6 +38,8 @@ async def lifespan(app: FastAPI):
     logger.info("Booting memory service ...")
     app.state.memory = MemoryService(settings)
     app.state.docstore = DocumentStore(settings)
+    app.state.globalmem = GlobalMemoryStore(settings)
+    app.state.msgstore = MessageStore(settings)
     logger.info("Memory service ready (user_id=%s)", settings.user_id)
     try:
         yield

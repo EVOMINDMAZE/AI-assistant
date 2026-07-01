@@ -145,6 +145,90 @@ MESSAGES_SCHEMA = {
 }
 
 
+AGENT_STATE_SCHEMA = {
+    "name": "agent_state",
+    "type": "base",
+    "schema": [
+        {
+            "name": "conversation_id",
+            "type": "relation",
+            "required": True,
+            "options": {
+                "collectionId": "__CONVERSATIONS_ID__",
+                "cascadeDelete": True,
+                "maxSelect": 1,
+            },
+        },
+        {"name": "agent_name", "type": "text", "required": True, "options": {"min": 1, "max": 64}},
+        {"name": "state_json", "type": "json", "required": True, "options": {"maxSize": 65535}},
+    ],
+    "indexes": [
+        "CREATE INDEX idx_state_conv ON agent_state (conversation_id)",
+        "CREATE UNIQUE INDEX idx_state_conv_agent ON agent_state (conversation_id, agent_name)",
+    ],
+    "listRule": "",
+    "viewRule": "",
+    "createRule": "",
+    "updateRule": "",
+    "deleteRule": "",
+}
+
+
+AGENT_MESSAGES_SCHEMA = {
+    "name": "agent_messages",
+    "type": "base",
+    "schema": [
+        {
+            "name": "conversation_id",
+            "type": "relation",
+            "required": True,
+            "options": {
+                "collectionId": "__CONVERSATIONS_ID__",
+                "cascadeDelete": True,
+                "maxSelect": 1,
+            },
+        },
+        {"name": "turn_id", "type": "text", "required": True, "options": {"min": 1, "max": 64}},
+        {"name": "from_agent", "type": "text", "required": True, "options": {"min": 1, "max": 64}},
+        {"name": "to_agent", "type": "text", "required": True, "options": {"min": 1, "max": 64}},
+        {"name": "message", "type": "text", "required": True, "options": {"max": 20000}},
+        {"name": "reply", "type": "text", "required": False, "options": {"max": 20000}},
+        {
+            "name": "status",
+            "type": "select",
+            "required": True,
+            "options": {"maxSelect": 1, "values": ["pending", "replied", "errored"]},
+        },
+    ],
+    "indexes": [
+        "CREATE INDEX idx_msg_conv ON agent_messages (conversation_id)",
+        "CREATE INDEX idx_msg_turn ON agent_messages (turn_id)",
+    ],
+    "listRule": "",
+    "viewRule": "",
+    "createRule": "",
+    "updateRule": "",
+    "deleteRule": "",
+}
+
+
+def _resolve_collection_refs(schema: dict, conv_id: str) -> dict:
+    """Replace __CONVERSATIONS_ID__ placeholders in any relation field."""
+    body = schema.copy()
+    body["schema"] = [
+        {
+            **f,
+            "options": {**f["options"], "collectionId": conv_id}
+            if (f.get("type") == "relation" and f["options"].get("collectionId") == "__CONVERSATIONS_ID__")
+            else f["options"],
+        }
+        if f.get("type") == "relation"
+        else f
+        for f in body["schema"]
+    ]
+    return body
+
+
 def main() -> None:
     if not ADMIN_EMAIL or not ADMIN_PASSWORD:
         print("Set POCKETBASE_ADMIN_EMAIL and POCKETBASE_ADMIN_PASSWORD first.")
@@ -167,18 +251,29 @@ def main() -> None:
             conv_id = conv["id"]
             print(f"[pb] created conversations ({conv_id}).")
 
+        # messages
         if "messages" in existing:
             print("[pb] messages already exists, skipping.")
         else:
-            body = MESSAGES_SCHEMA.copy()
-            body["schema"] = [
-                {**f, "options": {**f["options"], "collectionId": conv_id}}
-                if f["name"] == "conversation_id"
-                else f
-                for f in body["schema"]
-            ]
+            body = _resolve_collection_refs(MESSAGES_SCHEMA, conv_id)
             create_collection(client, token, body)
             print("[pb] created messages.")
+
+        # agent_state
+        if "agent_state" in existing:
+            print("[pb] agent_state already exists, skipping.")
+        else:
+            body = _resolve_collection_refs(AGENT_STATE_SCHEMA, conv_id)
+            create_collection(client, token, body)
+            print("[pb] created agent_state.")
+
+        # agent_messages
+        if "agent_messages" in existing:
+            print("[pb] agent_messages already exists, skipping.")
+        else:
+            body = _resolve_collection_refs(AGENT_MESSAGES_SCHEMA, conv_id)
+            create_collection(client, token, body)
+            print("[pb] created agent_messages.")
 
     print("[pb] done.")
 

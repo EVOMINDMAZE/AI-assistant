@@ -58,3 +58,49 @@ class StatusResponse(BaseModel):
     qdrant_ok: bool
     embedder_loaded: bool
     user_id: str
+
+
+# ── Global memory (cross-conversation, never pruned) ─
+
+class AddGlobalMemoryRequest(BaseModel):
+    user_id: str
+    fact: str
+    metadata: dict[str, Any] | None = None
+
+
+class SearchGlobalMemoryRequest(BaseModel):
+    user_id: str
+    query: str
+    limit: int = 5
+
+
+class GlobalMemoryHit(BaseModel):
+    id: str | None = None
+    fact: str
+    score: float | None = None
+    metadata: dict[str, Any] | None = None
+
+
+# ── Message index (cross-conversation search) ─
+
+class IndexMessageRequest(BaseModel):
+    user_id: str
+    conversation_id: str
+    message_id: str
+    role: str
+    text: str
+
+
+class SearchMessagesRequest(BaseModel):
+    user_id: str
+    query: str
+    limit: int = 5
+
+
+class MessageHit(BaseModel):
+    id: str | None = None
+    conversation_id: str
+    message_id: str
+    role: str
+    text: str
+    score: float | None = None

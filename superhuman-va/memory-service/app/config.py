@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     deepseek_base_url: str = Field(
         default="https://api.deepseek.com", alias="DEEPSEEK_BASE_URL"
     )
-    deepseek_model: str = Field(default="deepseek-chat", alias="DEEPSEEK_MODEL")
+    deepseek_model: str = Field(default="deepseek-v4-pro", alias="DEEPSEEK_MODEL")
 
     # ── Identity ──────────────────────────────────────
     user_id: str = Field(default="local-user", alias="USER_ID")
@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     mem0_collection: str = Field(default="memories", alias="MEM0_COLLECTION")
     documents_collection: str = Field(
         default="documents", alias="DOCUMENTS_COLLECTION"
+    )
+    global_memory_collection: str = Field(
+        default="memories_global", alias="GLOBAL_MEMORY_COLLECTION"
+    )
+    messages_collection: str = Field(
+        default="messages", alias="MESSAGES_COLLECTION"
     )
 
     # ── PocketBase ────────────────────────────────────

@@ -172,3 +172,274 @@ class DocumentStore:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Qdrant healthcheck failed: %s", exc)
             return False
+
+
+class GlobalMemoryStore:
+    """Separate Qdrant collection for global, never-pruned identity facts.
+
+    Lives in the same vector space as `memories` and `documents` (same embed
+    model). Used by the CoS to load cross-conversation identity facts into
+    the system prompt.
+    """
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.client = QdrantClient(
+            host=settings.qdrant_host,
+            port=settings.qdrant_port,
+            timeout=30,
+        )
+        logger.info("Loading embedder model %s for global pool ...", settings.embed_model)
+        self.embedder = TextEmbedding(model_name=settings.embed_model)
+        self._ensure_collection()
+
+    def _ensure_collection(self) -> None:
+        existing = {c.name for c in self.client.get_collections().collections}
+        if self.settings.global_memory_collection in existing:
+            return
+        logger.info(
+            "Creating Qdrant collection %s (dims=%d) ...",
+            self.settings.global_memory_collection,
+            self.settings.embed_dims,
+        )
+        self.client.create_collection(
+            collection_name=self.settings.global_memory_collection,
+            vectors_config=qmodels.VectorParams(
+                size=self.settings.embed_dims,
+                distance=qmodels.Distance.COSINE,
+            ),
+        )
+        self.client.create_payload_index(
+            collection_name=self.settings.global_memory_collection,
+            field_name="user_id",
+            field_schema=qmodels.PayloadSchemaType.KEYWORD,
+        )
+
+    def add(self, user_id: str, fact: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Add a global fact for the user. Never pruned."""
+        if not fact.strip():
+            return {"added": False}
+        vec = list(self.embedder.embed([fact]))[0].tolist()
+        point_id = uuid.uuid4().hex
+        self.client.upsert(
+            collection_name=self.settings.global_memory_collection,
+            points=[
+                qmodels.PointStruct(
+                    id=point_id,
+                    vector=vec,
+                    payload={
+                        "user_id": user_id,
+                        "fact": fact,
+                        "global": True,
+                        "metadata": metadata or {},
+                    },
+                )
+            ],
+            wait=True,
+        )
+        return {"added": True, "id": point_id}
+
+    def search(self, user_id: str, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        if not query.strip():
+            return []
+        qvec = list(self.embedder.embed([query]))[0].tolist()
+        result = self.client.search(
+            collection_name=self.settings.global_memory_collection,
+            query_vector=qvec,
+            limit=limit,
+            query_filter=qmodels.Filter(
+                must=[
+                    qmodels.FieldCondition(
+                        key="user_id",
+                        match=qmodels.MatchValue(value=user_id),
+                    )
+                ]
+            ),
+            with_payload=True,
+        )
+        return [
+            {
+                "id": p.id,
+                "fact": (p.payload or {}).get("fact", ""),
+                "score": p.score,
+                "metadata": (p.payload or {}).get("metadata"),
+            }
+            for p in result
+        ]
+
+    def list_all(self, user_id: str) -> list[dict[str, Any]]:
+        records, _ = self.client.scroll(
+            collection_name=self.settings.global_memory_collection,
+            scroll_filter=qmodels.Filter(
+                must=[
+                    qmodels.FieldCondition(
+                        key="user_id",
+                        match=qmodels.MatchValue(value=user_id),
+                    )
+                ]
+            ),
+            limit=1000,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return [
+            {
+                "id": r.id,
+                "fact": (r.payload or {}).get("fact", ""),
+                "metadata": (r.payload or {}).get("metadata"),
+            }
+            for r in records
+        ]
+
+    def delete_all(self, user_id: str) -> dict[str, Any]:
+        self.client.delete(
+            collection_name=self.settings.global_memory_collection,
+            points_selector=qmodels.FilterSelector(
+                filter=qmodels.Filter(
+                    must=[
+                        qmodels.FieldCondition(
+                            key="user_id",
+                            match=qmodels.MatchValue(value=user_id),
+                        )
+                    ]
+                )
+            ),
+            wait=True,
+        )
+        return {"deleted": True}
+
+
+class MessageStore:
+    """Index every user and assistant message for cross-conversation search.
+
+    Same vector space as `documents` and `memories` (same embed model). Used
+    by the Memory agent's `search_messages` tool to find past conversations
+    by what was said.
+    """
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.client = QdrantClient(
+            host=settings.qdrant_host,
+            port=settings.qdrant_port,
+            timeout=30,
+        )
+        self.embedder = TextEmbedding(model_name=settings.embed_model)
+        self._ensure_collection()
+
+    @property
+    def name(self) -> str:
+        return getattr(self.settings, "messages_collection", "messages")
+
+    def _ensure_collection(self) -> None:
+        existing = {c.name for c in self.client.get_collections().collections}
+        if self.name in existing:
+            return
+        logger.info("Creating Qdrant collection %s (dims=%d) ...", self.name, self.settings.embed_dims)
+        self.client.create_collection(
+            collection_name=self.name,
+            vectors_config=qmodels.VectorParams(
+                size=self.settings.embed_dims,
+                distance=qmodels.Distance.COSINE,
+            ),
+        )
+        self.client.create_payload_index(
+            collection_name=self.name,
+            field_name="user_id",
+            field_schema=qmodels.PayloadSchemaType.KEYWORD,
+        )
+
+    def add(
+        self,
+        user_id: str,
+        conversation_id: str,
+        message_id: str,
+        role: str,
+        text: str,
+    ) -> dict[str, Any]:
+        if not text.strip():
+            return {"added": False}
+        vec = list(self.embedder.embed([text]))[0].tolist()
+        point_id = uuid.uuid4().hex
+        self.client.upsert(
+            collection_name=self.name,
+            points=[
+                qmodels.PointStruct(
+                    id=point_id,
+                    vector=vec,
+                    payload={
+                        "user_id": user_id,
+                        "conversation_id": conversation_id,
+                        "message_id": message_id,
+                        "role": role,
+                        "text": text,
+                    },
+                )
+            ],
+            wait=True,
+        )
+        return {"added": True, "id": point_id}
+
+    def search(self, user_id: str, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        if not query.strip():
+            return []
+        qvec = list(self.embedder.embed([query]))[0].tolist()
+        result = self.client.search(
+            collection_name=self.name,
+            query_vector=qvec,
+            limit=limit,
+            query_filter=qmodels.Filter(
+                must=[
+                    qmodels.FieldCondition(
+                        key="user_id",
+                        match=qmodels.MatchValue(value=user_id),
+                    )
+                ]
+            ),
+            with_payload=True,
+        )
+        return [
+            {
+                "id": p.id,
+                "conversation_id": (p.payload or {}).get("conversation_id", ""),
+                "message_id": (p.payload or {}).get("message_id", ""),
+                "role": (p.payload or {}).get("role", ""),
+                "text": (p.payload or {}).get("text", ""),
+                "score": p.score,
+            }
+            for p in result
+        ]
+
+    def delete_for_conversation(self, conversation_id: str) -> dict[str, Any]:
+        self.client.delete(
+            collection_name=self.name,
+            points_selector=qmodels.FilterSelector(
+                filter=qmodels.Filter(
+                    must=[
+                        qmodels.FieldCondition(
+                            key="conversation_id",
+                            match=qmodels.MatchValue(value=conversation_id),
+                        )
+                    ]
+                )
+            ),
+            wait=True,
+        )
+        return {"deleted": True}
+
+    def delete_all(self, user_id: str) -> dict[str, Any]:
+        self.client.delete(
+            collection_name=self.name,
+            points_selector=qmodels.FilterSelector(
+                filter=qmodels.Filter(
+                    must=[
+                        qmodels.FieldCondition(
+                            key="user_id",
+                            match=qmodels.MatchValue(value=user_id),
+                        )
+                    ]
+                )
+            ),
+            wait=True,
+        )
+        return {"deleted": True}
