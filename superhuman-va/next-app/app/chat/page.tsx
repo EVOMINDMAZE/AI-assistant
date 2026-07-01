@@ -273,6 +273,17 @@ export default function ChatPage() {
     }
   }, []);
 
+  const handleSignOut = useCallback(async () => {
+    try {
+      await fetch("/api/auth", { method: "DELETE" });
+    } catch (err) {
+      console.warn("sign-out failed:", err);
+    } finally {
+      // Hard-redirect to /login so all in-memory state is dropped.
+      window.location.href = "/login";
+    }
+  }, []);
+
   useEffect(() => {
     if (conversationId) {
       setMessages([]);
@@ -328,6 +339,14 @@ export default function ChatPage() {
               title="Forget everything"
             >
               🧹
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleSignOut}
+              title="Sign out"
+            >
+              ⏻
             </Button>
           </div>
         </header>

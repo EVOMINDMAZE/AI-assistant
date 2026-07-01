@@ -151,6 +151,58 @@ export const deepseekAdapter = {
   itemsToMessages,
 };
 
+/**
+ * Non-streaming fallback for the chat route.
+ *
+ * When the SDK stream yields no `output_text_delta` events for ≥ 2 s (or
+ * throws), the route breaks out and calls this function. It uses the
+ * Runner to drive the agent without streaming and returns the final text
+ * + token usage (estimated from text length if the SDK didn't report any).
+ *
+ * The agent must be a fully-configured `Agent` from `@openai/agents`.
+ */
+export async function getResponseSync(
+  agent: import("@openai/agents").Agent,
+  input: string | import("@openai/agents").AgentInputItem[],
+  ctx: Record<string, unknown> = {}
+): Promise<{ text: string; usage: { input: number; output: number; reasoning: number; estimated: boolean } }> {
+  const { Runner } = await import("@openai/agents");
+  const runner = new Runner({ model: deepseekModel });
+  const result = await runner.run(agent, input as any, { context: ctx as any, stream: false } as any);
+  const text: string = String((result as any).finalOutput ?? "");
+  // Try to extract usage from the SDK result; fall back to length estimate.
+  const sdkUsage = (result as any).usage ?? (result as any).state?.modelResponses?.[0]?.usage;
+  let usage: { input: number; output: number; reasoning: number; estimated: boolean };
+  if (sdkUsage && (sdkUsage.prompt_tokens || sdkUsage.completion_tokens)) {
+    usage = {
+      input: sdkUsage.prompt_tokens ?? 0,
+      output: sdkUsage.completion_tokens ?? 0,
+      reasoning: sdkUsage.reasoning_tokens ?? 0,
+      estimated: false,
+    };
+  } else {
+    usage = estimateUsage(input, text);
+  }
+  return { text, usage };
+}
+
+/** Estimate token usage from text length (chars / 4). */
+export function estimateUsage(
+  input: string | unknown,
+  output: string
+): { input: number; output: number; reasoning: number; estimated: boolean } {
+  let inputStr = "";
+  if (typeof input === "string") inputStr = input;
+  else if (Array.isArray(input)) inputStr = JSON.stringify(input);
+  else if (input && typeof input === "object") inputStr = JSON.stringify(input);
+  return {
+    input: Math.ceil(inputStr.length / 4),
+    output: Math.ceil(output.length / 4),
+    reasoning: 0,
+    estimated: true,
+  };
+}
+
 /** The Model adapter for the OpenAI Agents SDK. */
 export const deepseekModel: Model = {
   async getResponse(systemPrompt, input, _modelSettings, _tools, _context) {

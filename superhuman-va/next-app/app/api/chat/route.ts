@@ -25,10 +25,11 @@ import { Runner } from "@openai/agents";
 import { ulid } from "ulid";
 import { z } from "zod";
 import { chiefOfStaff } from "@/lib/agents/specialists/chief-of-staff";
-import { deepseekModel } from "@/lib/agents/model";
+import { deepseekModel, getResponseSync } from "@/lib/agents/model";
 import { memoryClient } from "@/lib/memory-client";
 import { pbAsAdmin } from "@/lib/pocketbase";
 import { loadState, saveState, emptyCosState } from "@/lib/state";
+import { TraceStore, recordToolCall, commitTurn } from "@/lib/tracing";
 import type { ChatMessage } from "@/lib/types";
 import type { CosState, SSEEvent } from "@/lib/agent-types";
 
@@ -285,6 +286,10 @@ export async function POST(req: NextRequest) {
       let assistantBuffer = "";
       const agentMessages: { from: string; to: string; message: string; reply?: string }[] = [];
       const conflictEmitted = { value: false };
+      let firstDeltaAt: number | null = null;
+      let lastDeltaAt: number | null = null;
+      let streamBroke = false;
+      let toolStarts: Record<string, number> = {}; // toolName → start ms
 
       try {
         const runResult = runner.runStreamed(chiefOfStaff, inputItems, {
@@ -299,92 +304,163 @@ export async function POST(req: NextRequest) {
           },
         });
 
-        for await (const event of runResult as any) {
-          // The OpenAI Agents SDK stream events shape:
-          //   - raw_model_stream_event (model streaming events, includes output_text_delta)
-          //   - run_item_stream_event (tool calls, tool results, messages)
-          //   - agent_updated_stream_event (handoffs)
-          //   - tool_call_*
-          // We translate each into SSE.
-          if (event?.type === "raw_model_stream_event") {
-            const raw = event?.data;
-            if (raw?.type === "output_text_delta" && raw?.delta) {
-              const t: SSEEvent = { type: "token", delta: raw.delta };
-              assistantBuffer += raw.delta;
-              const id = bufferEvent(conversationId!, t);
-              controller.enqueue(sse.encode(id, t));
-            }
-            continue;
-          }
-          if (event?.type === "run_item_stream_event") {
-            const item = event?.item ?? event?.data;
-            const itype = item?.type;
-            if (itype === "tool_call" || itype === "tool_use" || event?.name === "tool_call_created") {
-              const t: SSEEvent = {
-                type: "tool_start",
-                agent: chiefOfStaff.name,
-                tool: item?.name ?? item?.tool_name ?? "tool",
-                args: item?.arguments ?? item?.args ?? item?.parameters,
-              };
-              const id = bufferEvent(conversationId!, t);
-              controller.enqueue(sse.encode(id, t));
-              // Special-case consult_agent -> emit agent_message
-              if (t.tool === "consult_agent") {
-                const args: any = t.args ?? {};
-                const from = "CoS";
-                const to = args?.agent_name ?? "?";
-                const msg = args?.message ?? "";
-                agentMessages.push({ from, to, message: msg });
-                const am: SSEEvent = { type: "agent_message", from, to, message: msg };
-                const amid = bufferEvent(conversationId!, am);
-                controller.enqueue(sse.encode(amid, am));
-              }
-              // Special-case run_code / compute -> emit code_run
-              if (t.tool === "run_code" || t.tool === "compute") {
-                const args: any = t.args ?? {};
-                const cr: SSEEvent = {
-                  type: "code_run",
-                  agent: "CoS",
-                  snippet: args?.snippet ?? args?.expression ?? "",
-                  stdout: "",
-                };
-                const crid = bufferEvent(conversationId!, cr);
-                controller.enqueue(sse.encode(crid, cr));
-              }
-              // Special-case resolve_conflict
-              if (t.tool === "resolve_conflict") {
-                const args: any = t.args ?? {};
-                if (args?.conflict_type === "values_tradeoff") {
-                  // We'll wait for the tool result to emit the conflict event
+        // Watchdog: if the SDK stream yields no deltas for ≥ 2 s, fall back
+        // to a non-streaming call. This is the SF-2/SF-3 fix from
+        // .trae/specs/fix-top3-broken.
+        const STREAM_QUIET_MS = 2000;
+        let watcher: NodeJS.Timeout | null = null;
+        const startWatcher = () => {
+          if (watcher) clearTimeout(watcher);
+          watcher = setTimeout(async () => {
+            if (streamBroke) return;
+            if (lastDeltaAt === null) {
+              // No delta ever arrived — call the non-streaming fallback.
+              console.warn(`[chat] stream yielded no deltas within ${STREAM_QUIET_MS}ms; falling back to getResponseSync`);
+              streamBroke = true;
+              try {
+                const fb = await getResponseSync(chiefOfStaff, inputItems, {
+                  conversationId,
+                  userId,
+                  turnId,
+                  reasoning: "think_high",
+                  fromAgent: "CoS",
+                  a2aDepth: 0,
+                  a2aConsultsThisTurn: 0,
+                });
+                if (fb.text) {
+                  assistantBuffer += fb.text;
+                  const t: SSEEvent = { type: "token", delta: fb.text };
+                  const id = bufferEvent(conversationId!, t);
+                  controller.enqueue(sse.encode(id, t));
                 }
+                // Commit trace for the fallback path
+                commitTurn({
+                  turnId,
+                  conversationId: conversationId!,
+                  userId,
+                  finalText: assistantBuffer,
+                  usage: fb.usage,
+                });
+              } catch (fbErr: any) {
+                console.error("[chat] fallback getResponseSync failed:", fbErr);
+                const e: SSEEvent = { type: "error", message: `fallback failed: ${fbErr?.message ?? String(fbErr)}` };
+                const id = bufferEvent(conversationId!, e);
+                controller.enqueue(sse.encode(id, e));
               }
-            } else if (itype === "tool_result" || itype === "tool_result" || event?.name === "tool_call_done") {
-              const result = item?.output ?? item?.result ?? item?.data;
-              const t: SSEEvent = {
-                type: "tool_done",
-                agent: chiefOfStaff.name,
-                tool: item?.name ?? item?.tool_name ?? "tool",
-                result,
-              };
-              const id = bufferEvent(conversationId!, t);
-              controller.enqueue(sse.encode(id, t));
-              // If resolve_conflict returned a values_tradeoff marker, emit `conflict`
-              if (
-                t.tool === "resolve_conflict" &&
-                result &&
-                typeof result === "object" &&
-                (result as any).strategy === "values_tradeoff"
-              ) {
-                const c: SSEEvent = {
-                  type: "conflict",
-                  conflictId: (result as any).conflictId,
-                  question: (result as any).question,
-                  options: (result as any).options ?? [],
+              const doneEvt: SSEEvent = { type: "done" };
+              const did = bufferEvent(conversationId!, doneEvt);
+              controller.enqueue(sse.encode(did, doneEvt));
+              controller.close();
+            }
+          }, STREAM_QUIET_MS);
+          watcher.unref?.();
+        };
+        startWatcher();
+
+        try {
+          for await (const event of runResult as any) {
+            // The OpenAI Agents SDK stream events shape:
+            //   - raw_model_stream_event (model streaming events, includes output_text_delta)
+            //   - run_item_stream_event (tool calls, tool results, messages)
+            //   - agent_updated_stream_event (handoffs)
+            //   - tool_call_*
+            // We translate each into SSE.
+            if (event?.type === "raw_model_stream_event") {
+              const raw = event?.data;
+              if (raw?.type === "output_text_delta" && raw?.delta) {
+                const t: SSEEvent = { type: "token", delta: raw.delta };
+                assistantBuffer += raw.delta;
+                lastDeltaAt = Date.now();
+                if (firstDeltaAt === null) firstDeltaAt = lastDeltaAt;
+                startWatcher(); // reset the quiet-time watchdog
+                const id = bufferEvent(conversationId!, t);
+                controller.enqueue(sse.encode(id, t));
+              }
+              continue;
+            }
+            if (event?.type === "run_item_stream_event") {
+              const item = event?.item ?? event?.data;
+              const itype = item?.type;
+              if (itype === "tool_call" || itype === "tool_use" || event?.name === "tool_call_created") {
+                const t: SSEEvent = {
+                  type: "tool_start",
+                  agent: chiefOfStaff.name,
+                  tool: item?.name ?? item?.tool_name ?? "tool",
+                  args: item?.arguments ?? item?.args ?? item?.parameters,
                 };
-                conflictEmitted.value = true;
-                const cid = bufferEvent(conversationId!, c);
-                controller.enqueue(sse.encode(cid, c));
-                // Note: we DO NOT emit a `done` here. The stream pauses until the
+                const id = bufferEvent(conversationId!, t);
+                controller.enqueue(sse.encode(id, t));
+                toolStarts[t.tool] = Date.now();
+                // Special-case consult_agent -> emit agent_message
+                if (t.tool === "consult_agent") {
+                  const args: any = t.args ?? {};
+                  const from = "CoS";
+                  const to = args?.agent_name ?? "?";
+                  const msg = args?.message ?? "";
+                  agentMessages.push({ from, to, message: msg });
+                  const am: SSEEvent = { type: "agent_message", from, to, message: msg };
+                  const amid = bufferEvent(conversationId!, am);
+                  controller.enqueue(sse.encode(amid, am));
+                }
+                // Special-case run_code / compute -> emit code_run
+                if (t.tool === "run_code" || t.tool === "compute") {
+                  const args: any = t.args ?? {};
+                  const cr: SSEEvent = {
+                    type: "code_run",
+                    agent: "CoS",
+                    snippet: args?.snippet ?? args?.expression ?? "",
+                    stdout: "",
+                  };
+                  const crid = bufferEvent(conversationId!, cr);
+                  controller.enqueue(sse.encode(crid, cr));
+                }
+                // Special-case resolve_conflict
+                if (t.tool === "resolve_conflict") {
+                  const args: any = t.args ?? {};
+                  if (args?.conflict_type === "values_tradeoff") {
+                    // We'll wait for the tool result to emit the conflict event
+                  }
+                }
+              } else if (itype === "tool_result" || itype === "tool_result" || event?.name === "tool_call_done") {
+                const result = item?.output ?? item?.result ?? item?.data;
+                const toolName = item?.name ?? item?.tool_name ?? "tool";
+                const t: SSEEvent = {
+                  type: "tool_done",
+                  agent: chiefOfStaff.name,
+                  tool: toolName,
+                  result,
+                };
+                const id = bufferEvent(conversationId!, t);
+                controller.enqueue(sse.encode(id, t));
+                // TR-2: record the tool call for the trace
+                const toolStartedAt = toolStarts[toolName];
+                const toolDurationMs = toolStartedAt ? Date.now() - toolStartedAt : 0;
+                recordToolCall({
+                  turnId,
+                  agent: chiefOfStaff.name,
+                  tool: toolName,
+                  args: (item as any)?.arguments ?? (item as any)?.args ?? (item as any)?.parameters,
+                  result,
+                  durationMs: toolDurationMs,
+                });
+                delete toolStarts[toolName];
+                // If resolve_conflict returned a values_tradeoff marker, emit `conflict`
+                if (
+                  t.tool === "resolve_conflict" &&
+                  result &&
+                  typeof result === "object" &&
+                  (result as any).strategy === "values_tradeoff"
+                ) {
+                  const c: SSEEvent = {
+                    type: "conflict",
+                    conflictId: (result as any).conflictId,
+                    question: (result as any).question,
+                    options: (result as any).options ?? [],
+                  };
+                  conflictEmitted.value = true;
+                  const cid = bufferEvent(conversationId!, c);
+                  controller.enqueue(sse.encode(cid, c));
+                  // Note: we DO NOT emit a `done` here. The stream pauses until the
                 // user POSTs back with kind=conflict_resolution. But the
                 // ReadableStream's contract requires us to either close it or
                 // keep it open. We close it; the client knows the next message
@@ -393,51 +469,81 @@ export async function POST(req: NextRequest) {
                 const doneEvt: SSEEvent = { type: "done" };
                 const did = bufferEvent(conversationId!, doneEvt);
                 controller.enqueue(sse.encode(did, doneEvt));
+                // TR-3: also commit a trace on the conflict-pause path
+                commitTurn({
+                  turnId,
+                  conversationId: conversationId!,
+                  userId,
+                  finalText: assistantBuffer,
+                  usage: { input: 0, output: Math.ceil(assistantBuffer.length / 4), reasoning: 0, estimated: true },
+                });
                 controller.close();
                 return;
-              }
-              // If resolve_conflict domain_internal/technical_factual -> emit conflict_resolved
-              if (
-                t.tool === "resolve_conflict" &&
-                result &&
-                typeof result === "object" &&
-                ((result as any).strategy === "domain_internal" ||
-                  (result as any).strategy === "technical_factual")
-              ) {
-                const cr: SSEEvent = {
-                  type: "conflict_resolved",
-                  winner: (result as any).winner ?? "CoS",
-                  reason:
-                    (result as any).reason ??
-                    (result as any).verdict ??
-                    "Conflict resolved",
-                  strategy: (result as any).strategy,
-                };
-                const crid = bufferEvent(conversationId!, cr);
-                controller.enqueue(sse.encode(crid, cr));
-              }
-              // If consult_agent returned a reply, attach it to the last agent_message
-              if (t.tool === "consult_agent" && result && typeof result === "object") {
-                const last = agentMessages[agentMessages.length - 1];
-                if (last) {
-                  last.reply = (result as any).reply ?? (result as any).error ?? "";
                 }
+                // If resolve_conflict domain_internal/technical_factual -> emit conflict_resolved
+                if (
+                  t.tool === "resolve_conflict" &&
+                  result &&
+                  typeof result === "object" &&
+                  ((result as any).strategy === "domain_internal" ||
+                    (result as any).strategy === "technical_factual")
+                ) {
+                  const cr: SSEEvent = {
+                    type: "conflict_resolved",
+                    winner: (result as any).winner ?? "CoS",
+                    reason:
+                      (result as any).reason ??
+                      (result as any).verdict ??
+                      "Conflict resolved",
+                    strategy: (result as any).strategy,
+                  };
+                  const crid = bufferEvent(conversationId!, cr);
+                  controller.enqueue(sse.encode(crid, cr));
+                }
+                // If consult_agent returned a reply, attach it to the last agent_message
+                if (t.tool === "consult_agent" && result && typeof result === "object") {
+                  const last = agentMessages[agentMessages.length - 1];
+                  if (last) {
+                    last.reply = (result as any).reply ?? (result as any).error ?? "";
+                  }
+                }
+              } else if (itype === "message_output" || itype === "message" || itype === "output_message") {
+                // Could be the final message; already streamed via raw_model_stream_event
               }
-            } else if (itype === "message_output" || itype === "message" || itype === "output_message") {
-              // Could be the final message; already streamed via raw_model_stream_event
+              continue;
             }
-            continue;
+            if (event?.type === "agent_updated_stream_event" || event?.type === "agent_updated") {
+              const t: SSEEvent = {
+                type: "handoff",
+                from: chiefOfStaff.name,
+                to: event?.agent?.name ?? event?.data?.name ?? "agent",
+              };
+              const id = bufferEvent(conversationId!, t);
+              controller.enqueue(sse.encode(id, t));
+              continue;
+            }
           }
-          if (event?.type === "agent_updated_stream_event" || event?.type === "agent_updated") {
-            const t: SSEEvent = {
-              type: "handoff",
-              from: chiefOfStaff.name,
-              to: event?.agent?.name ?? event?.data?.name ?? "agent",
-            };
-            const id = bufferEvent(conversationId!, t);
-            controller.enqueue(sse.encode(id, t));
-            continue;
-          }
+        } catch (streamErr: any) {
+          // SF-4: stream threw mid-loop
+          console.error("[chat] CoS stream threw mid-loop:", streamErr);
+          streamBroke = true;
+          if (watcher) clearTimeout(watcher);
+          const e: SSEEvent = { type: "error", message: streamErr?.message ?? String(streamErr) };
+          const id = bufferEvent(conversationId!, e);
+          controller.enqueue(sse.encode(id, e));
+          // Fall through to the persistence + trace commit below; the route
+          // will persist whatever partial text we already buffered.
+        }
+        if (watcher) clearTimeout(watcher);
+        if (streamBroke) {
+          // The fallback already emitted `done` and closed the stream; or
+          // the catch block above emitted an error and we want to close.
+          if (!controller.desiredSize) return; // already closed
+          const doneEvt: SSEEvent = { type: "done" };
+          const did = bufferEvent(conversationId!, doneEvt);
+          try { controller.enqueue(sse.encode(did, doneEvt)); } catch {}
+          try { controller.close(); } catch {}
+          return;
         }
 
         // 2. Final assistant text may have been captured via deltas
@@ -461,30 +567,55 @@ export async function POST(req: NextRequest) {
         controller.close();
 
         // 4. Post-stream persistence (fire-and-await but doesn't block the SSE)
-        void persistAfterStream(
-          conversationId!,
-          userId,
-          message,
-          assistantBuffer,
+        try {
+          await persistAfterStream(
+            conversationId!,
+            userId,
+            message,
+            assistantBuffer,
+            turnId,
+            cosState,
+            agentMessages
+          );
+        } catch (e) {
+          console.error("[chat] post-stream persist failed:", e);
+        }
+
+        // 5. TR-3/4: Commit the trace for the success path. Tool calls
+        // have already been recorded via recordToolCall; commitTurn builds
+        // the final payload and writes the row.
+        commitTurn({
           turnId,
-          cosState,
-          agentMessages
-        ).catch((e) => console.error("[chat] post-stream persist failed:", e));
+          conversationId: conversationId!,
+          userId,
+          finalText: assistantBuffer,
+          usage: { input: 0, output: Math.ceil(assistantBuffer.length / 4), reasoning: 0, estimated: true },
+        });
       } catch (err: any) {
         console.error("[chat] CoS stream failed:", err);
         const e: SSEEvent = { type: "error", message: err?.message ?? String(err) };
         const id = bufferEvent(conversationId!, e);
         controller.enqueue(sse.encode(id, e));
         // Persist partial text + record failure
-        void persistAfterStream(
-          conversationId!,
-          userId,
-          message,
-          assistantBuffer + `\n\n[error] ${e.message}`,
+        try {
+          await persistAfterStream(
+            conversationId!,
+            userId,
+            message,
+            assistantBuffer + `\n\n[error] ${e.message}`,
+            turnId,
+            cosState,
+            agentMessages
+          );
+        } catch {}
+        // TR-3: also commit a trace on the error path
+        commitTurn({
           turnId,
-          cosState,
-          agentMessages
-        ).catch(() => {});
+          conversationId: conversationId!,
+          userId,
+          finalText: assistantBuffer + `\n\n[error] ${e.message}`,
+          usage: { input: 0, output: 0, reasoning: 0, estimated: true },
+        });
         const doneEvt: SSEEvent = { type: "done" };
         const did = bufferEvent(conversationId!, doneEvt);
         controller.enqueue(sse.encode(did, doneEvt));

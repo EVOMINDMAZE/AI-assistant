@@ -212,6 +212,31 @@ AGENT_MESSAGES_SCHEMA = {
 }
 
 
+# ── Auth sessions (T2.1 + AU-1 fix from .trae/specs/fix-top3-broken) ─────
+# Sessions live in PocketBase so they survive a Next.js process restart.
+# The `token` field is a 32-byte random hex string. The middleware reads
+# the `va_session` cookie, looks up the row, and confirms expires_at > now.
+AUTH_SESSIONS_SCHEMA = {
+    "name": "auth_sessions",
+    "type": "base",
+    "schema": [
+        {"name": "token", "type": "text", "required": True, "options": {"min": 16, "max": 128}},
+        {"name": "user_id", "type": "text", "required": True, "options": {"min": 1, "max": 200}},
+        {"name": "expires_at", "type": "date", "required": True, "options": {}},
+        {"name": "created_at", "type": "date", "required": False, "options": {}},
+    ],
+    "indexes": [
+        "CREATE UNIQUE INDEX idx_session_token ON auth_sessions (token)",
+        "CREATE INDEX idx_session_expires ON auth_sessions (expires_at)",
+    ],
+    "listRule": "",
+    "viewRule": "",
+    "createRule": "",
+    "updateRule": "",
+    "deleteRule": "",
+}
+
+
 def _resolve_collection_refs(schema: dict, conv_id: str) -> dict:
     """Replace __CONVERSATIONS_ID__ placeholders in any relation field."""
     body = schema.copy()
@@ -274,6 +299,13 @@ def main() -> None:
             body = _resolve_collection_refs(AGENT_MESSAGES_SCHEMA, conv_id)
             create_collection(client, token, body)
             print("[pb] created agent_messages.")
+
+        # auth_sessions
+        if "auth_sessions" in existing:
+            print("[pb] auth_sessions already exists, skipping.")
+        else:
+            create_collection(client, token, AUTH_SESSIONS_SCHEMA)
+            print("[pb] created auth_sessions.")
 
     print("[pb] done.")
 

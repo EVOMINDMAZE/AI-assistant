@@ -208,3 +208,62 @@ export function computeCostUsd(usage: { input: number; output: number; reasoning
     (usage.reasoning ?? 0) * RATE_REASON
   );
 }
+
+/** Per-turn in-memory buffer of tool calls. Cleared on commitTurn. */
+const TURN_BUFFER = new Map<string, { tool_calls: { agent: string; tool: string; args: unknown; result: unknown; duration_ms: number }[]; started_at: number }>();
+
+/** Record a single tool call from the chat route. Buffered until commitTurn. */
+export function recordToolCall(rec: {
+  turnId: string;
+  agent: string;
+  tool: string;
+  args: unknown;
+  result: unknown;
+  durationMs: number;
+}): void {
+  const buf = TURN_BUFFER.get(rec.turnId) ?? { tool_calls: [], started_at: Date.now() };
+  buf.tool_calls.push({
+    agent: rec.agent,
+    tool: rec.tool,
+    args: rec.args,
+    result: rec.result,
+    duration_ms: rec.durationMs,
+  });
+  TURN_BUFFER.set(rec.turnId, buf);
+}
+
+/** Commit a turn to the trace store. Builds the full payload, writes the row, clears the buffer. */
+export function commitTurn(rec: {
+  turnId: string;
+  conversationId: string;
+  userId: string;
+  finalText: string;
+  usage: { input: number; output: number; reasoning: number; estimated?: boolean };
+}): void {
+  const buf = TURN_BUFFER.get(rec.turnId);
+  const toolCalls = buf?.tool_calls ?? [];
+  TURN_BUFFER.delete(rec.turnId);
+  const cost_usd = computeCostUsd({
+    input: rec.usage.input,
+    output: rec.usage.output,
+    reasoning: rec.usage.reasoning,
+  });
+  TraceStore.append({
+    turnId: rec.turnId,
+    userId: rec.userId,
+    conversationId: rec.conversationId,
+    payload: {
+      cos_input: undefined,
+      tool_calls: toolCalls,
+      a2a_consults: [],
+      final_text: rec.finalText,
+      token_usage: {
+        input: rec.usage.input,
+        output: rec.usage.output,
+        reasoning: rec.usage.reasoning,
+        estimated: rec.usage.estimated ?? false,
+      },
+      cost_usd,
+    },
+  });
+}
