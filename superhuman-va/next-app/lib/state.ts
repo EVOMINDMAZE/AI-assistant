@@ -1,56 +1,53 @@
 /**
  * Per-conversation working memory for the CoS and specialists.
  *
- * Backed by PocketBase `agent_state` collection. Unique per (conv, agent).
+ * Backed by Supabase `agent_state` table. Unique per (conv, agent).
  * The CoS reads its state at the start of every turn and writes at the end
  * (last write wins).
  */
-import type PocketBase from "pocketbase";
+import "server-only";
 import type { CosState } from "./agent-types";
-
-const COLLECTION = "agent_state";
+import { createAdminSupabase } from "@/lib/supabase/admin";
 
 export async function loadState(
-  pb: PocketBase,
   conversationId: string,
   agentName: string
 ): Promise<CosState | null> {
-  try {
-    const records = await pb.collection(COLLECTION).getList(1, 1, {
-      filter: `conversation_id="${conversationId}" && agent_name="${agentName}"`,
-    });
-    if (records.items.length === 0) return null;
-    return records.items[0].state_json as CosState;
-  } catch (err) {
-    console.warn(`[state] loadState failed for ${agentName} in ${conversationId}:`, err);
+  const sb = createAdminSupabase();
+  const { data, error } = await sb
+    .from("agent_state")
+    .select("state_json")
+    .eq("conversation_id", conversationId)
+    .eq("agent_name", agentName)
+    .maybeSingle();
+  if (error) {
+    console.warn(`[state] loadState failed for ${agentName} in ${conversationId}:`, error);
     return null;
   }
+  if (!data) return null;
+  return data.state_json as CosState;
 }
 
 export async function saveState(
-  pb: PocketBase,
   conversationId: string,
   agentName: string,
   state: CosState
 ): Promise<void> {
-  try {
-    const existing = await pb.collection(COLLECTION).getList(1, 1, {
-      filter: `conversation_id="${conversationId}" && agent_name="${agentName}"`,
-    });
-    if (existing.items.length > 0) {
-      await pb.collection(COLLECTION).update(existing.items[0].id, {
-        state_json: state,
-      });
-    } else {
-      await pb.collection(COLLECTION).create({
+  const sb = createAdminSupabase();
+  const { error } = await sb
+    .from("agent_state")
+    .upsert(
+      {
         conversation_id: conversationId,
         agent_name: agentName,
         state_json: state,
-      });
-    }
-  } catch (err) {
-    console.error(`[state] saveState failed for ${agentName} in ${conversationId}:`, err);
-    throw err;
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "conversation_id,agent_name" }
+    );
+  if (error) {
+    console.error(`[state] saveState failed for ${agentName} in ${conversationId}:`, error);
+    throw error;
   }
 }
 

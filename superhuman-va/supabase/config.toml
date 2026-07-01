@@ -1,0 +1,68 @@
+# Supabase project name (used by `supabase` CLI)
+project_name = "superhuman-va"
+
+# A string used to distinguish different Supabase projects on the same host.
+# Defaults to the working directory name when running `supabase init`.
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[db.pooler]
+enabled = false
+# Port 5432 is the local Postgres port; pooler uses 6543 by default.
+port = 5432
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
+
+[realtime]
+enabled = true
+
+[studio]
+enabled = true
+port = 54323
+# External URL: http://localhost:54323
+api_url = "http://127.0.0.1"
+
+[inbucket]
+enabled = true
+port = 54324
+# External URL: http://localhost:54324
+
+[storage]
+enabled = true
+# The default file size limit is 1 GiB. Reduce to 25 MiB to match Vercel serverless limits.
+file_size_limit = "25MiB"
+
+[auth]
+enabled = true
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["https://*.vercel.app"]
+jwt_expiry = 3600
+enable_signup = true
+enable_anonymous_sign_ins = false
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+enable_confirmations = false
+secure_password_change = false
+
+[auth.sms]
+enable_signup = false
+enable_confirmations = false
+
+[edge_runtime]
+enabled = true
+# Configure one or more regions to use for edge functions.
+# https://supabase.com/docs/guides/functions#regions
+# Default to "us-east-1" (iad1) to match the Vercel region in vercel.json.
+regions = ["us-east-1"]

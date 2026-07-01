@@ -6,12 +6,12 @@
  *   - values_tradeoff   → emit `conflict` SSE; pause the stream; user picks
  *   - technical_factual → invoke Critic with Think Max + arbitration suffix
  */
+import "server-only";
 import { tool } from "@openai/agents";
 import { z } from "zod";
 import { ulid } from "ulid";
 import { Runner } from "@openai/agents";
 import { deepseekModel, type ReasoningMode } from "@/lib/agents/model";
-import { pbAsAdmin } from "@/lib/pocketbase";
 import { postMessage, markReplied, markErrored } from "@/lib/messaging";
 import type { AgentConfig } from "@/lib/agent-types";
 
@@ -46,7 +46,6 @@ export function getResolveConflictTool(importCritic: () => Promise<any>) {
     }),
     async execute({ question, positions, conflict_type, recommendation }, runContext?: any) {
       const ctx = runContext?.context ?? {};
-      const pb = pbAsAdmin();
       const turnId = ctx.turnId ?? ulid();
       const conversationId = ctx.conversationId ?? "unknown";
 
@@ -58,7 +57,7 @@ export function getResolveConflictTool(importCritic: () => Promise<any>) {
         // as the winner. In practice the CoS picks the winner BEFORE calling
         // resolve_conflict and passes the winner's stance here.
         const winner = positions[0];
-        const row = await postMessage(pb, {
+        const row = await postMessage({
           conversation_id: conversationId,
           turn_id: turnId,
           from_agent: "CoS",
@@ -66,7 +65,6 @@ export function getResolveConflictTool(importCritic: () => Promise<any>) {
           message: `[domain_internal] ${question} | positions: ${JSON.stringify(positions)}`,
         });
         await markReplied(
-          pb,
           row.id,
           `CoS ruled: ${winner.agent} wins — ${winner.reasoning}`
         );
@@ -85,7 +83,7 @@ export function getResolveConflictTool(importCritic: () => Promise<any>) {
           recommendation: recommendation === String.fromCharCode(97 + i),
         }));
         const conflictId = ulid();
-        const row = await postMessage(pb, {
+        const row = await postMessage({
           conversation_id: conversationId,
           turn_id: turnId,
           from_agent: "CoS",
@@ -93,7 +91,6 @@ export function getResolveConflictTool(importCritic: () => Promise<any>) {
           message: `[values_tradeoff] ${question} | options: ${JSON.stringify(options)}`,
         });
         await markReplied(
-          pb,
           row.id,
           `Awaiting user choice (conflictId=${conflictId})`
         );
@@ -111,7 +108,7 @@ export function getResolveConflictTool(importCritic: () => Promise<any>) {
 
       // ── technical_factual: Critic arbitrates in Think Max ──
       if (conflict_type === "technical_factual") {
-        const row = await postMessage(pb, {
+        const row = await postMessage({
           conversation_id: conversationId,
           turn_id: turnId,
           from_agent: "CoS",
@@ -137,11 +134,11 @@ export function getResolveConflictTool(importCritic: () => Promise<any>) {
             typeof (result as any).finalOutput === "string"
               ? (result as any).finalOutput
               : JSON.stringify((result as any).finalOutput ?? "");
-          await markReplied(pb, row.id, verdict);
+          await markReplied(row.id, verdict);
           return { strategy: "technical_factual", verdict };
         } catch (err: any) {
           const errMsg = err?.message ?? String(err);
-          await markErrored(pb, row.id, errMsg);
+          await markErrored(row.id, errMsg);
           return { strategy: "technical_factual", error: errMsg };
         }
       }

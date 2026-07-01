@@ -2,21 +2,36 @@
 // POST   /api/conversations  → create a new conversation
 // DELETE /api/conversations?id=<id> → delete conversation + all child rows
 import { NextRequest, NextResponse } from "next/server";
-import { pbAsAdmin } from "@/lib/pocketbase";
-import { USER_ID } from "@/lib/deepseek";
-import type { Conversation } from "@/lib/types";
+import { createServerSupabase } from "@/lib/supabase/server";
+import { createAdminSupabase } from "@/lib/supabase/admin";
 import { memoryClient } from "@/lib/memory-client";
+import type { Conversation } from "@/lib/types";
 
 export const runtime = "nodejs";
 
+async function getUserId(): Promise<string> {
+  // For now we still rely on the local user id; once Supabase Auth is wired
+  // up, this becomes the auth.uid().
+  return process.env.USER_ID || "local-user";
+}
+
 export async function GET() {
   try {
-    const pb = await pbAsAdmin();
-    const list = await pb.collection("conversations").getList(1, 50, {
-      filter: `user_id = "${USER_ID}"`,
-      sort: "-updated",
-    });
-    return NextResponse.json({ results: list.items as Conversation[] });
+    const sb = createServerSupabase();
+    const userId = await getUserId();
+    const { data, error } = await sb
+      .from("conversations")
+      .select("id, user_id, title, created_at, updated_at")
+      .eq("user_id", userId)
+      .order("updated_at", { ascending: false })
+      .limit(50);
+    if (error) {
+      return NextResponse.json(
+        { error: "list conversations failed", detail: error.message },
+        { status: 500 }
+      );
+    }
+    return NextResponse.json({ results: data as Conversation[] });
   } catch (err) {
     return NextResponse.json(
       { error: "list conversations failed", detail: String(err) },
@@ -28,12 +43,23 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const body = (await req.json()) as { title?: string };
-    const pb = await pbAsAdmin();
-    const conv = await pb.collection("conversations").create({
-      user_id: USER_ID,
-      title: body.title?.trim() || "New chat",
-    });
-    return NextResponse.json({ conversation: conv as Conversation });
+    const sb = createServerSupabase();
+    const userId = await getUserId();
+    const { data, error } = await sb
+      .from("conversations")
+      .insert({
+        user_id: userId,
+        title: body.title?.trim() || "New chat",
+      })
+      .select("id, user_id, title, created_at, updated_at")
+      .single();
+    if (error) {
+      return NextResponse.json(
+        { error: "create conversation failed", detail: error.message },
+        { status: 500 }
+      );
+    }
+    return NextResponse.json({ conversation: data as Conversation });
   } catch (err) {
     return NextResponse.json(
       { error: "create conversation failed", detail: String(err) },
@@ -48,18 +74,20 @@ export async function DELETE(req: NextRequest) {
     if (!id) {
       return NextResponse.json({ error: "id required" }, { status: 400 });
     }
-    const pb = await pbAsAdmin();
-    // Delete child rows
-    const msgs = await pb.collection("messages").getFullList({ filter: `conversation_id="${id}"` });
-    for (const m of msgs) await pb.collection("messages").delete(m.id);
-    const states = await pb.collection("agent_state").getFullList({ filter: `conversation_id="${id}"` });
-    for (const s of states) await pb.collection("agent_state").delete(s.id);
-    const a2a = await pb.collection("agent_messages").getFullList({ filter: `conversation_id="${id}"` });
-    for (const a of a2a) await pb.collection("agent_messages").delete(a.id);
-    await pb.collection("conversations").delete(id);
-    // Best-effort: clear from Qdrant message index (we don't have an
-    // endpoint for delete-by-conversation, so this is a no-op for now).
-    void memoryClient.clearMessages(USER_ID).catch(() => {});
+    const sb = createAdminSupabase();
+    const userId = await getUserId();
+    // Cascade deletes handle messages, agent_state, agent_messages
+    // (see ON DELETE CASCADE in 0001_init.sql). We just need to delete the
+    // conversation row.
+    const { error } = await sb.from("conversations").delete().eq("id", id);
+    if (error) {
+      return NextResponse.json(
+        { error: "delete conversation failed", detail: error.message },
+        { status: 500 }
+      );
+    }
+    // Best-effort: clear from the message_index for this user.
+    void memoryClient.clearMessages(userId).catch(() => {});
     return NextResponse.json({ ok: true });
   } catch (err) {
     return NextResponse.json(

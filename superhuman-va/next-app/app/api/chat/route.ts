@@ -1,9 +1,9 @@
 // POST /api/chat
 //
 // CoS-driven streaming chat endpoint (V2). Flow:
-//   1. Ensure conversation exists in PB.
+//   1. Ensure conversation exists in Supabase.
 //   2. Parallel: load history, load CoS agent_state, load global facts, search
-//      Qdrant docs, rate-limit check.
+//      pgvector docs, rate-limit check.
 //   3. Build the CoS input with: system prompt (with GLOBAL FACTS + WORKING
 //      MEMORY injected), history, user message.
 //   4. Run Runner.runStreamed(coS, input, { context: { conversationId,
@@ -12,7 +12,7 @@
 //      lib/agent-types.ts: meta, token, tool_start, tool_done, handoff,
 //      agent_message, code_run, conflict, conflict_resolved, error, done.
 //   6. Persist user + assistant messages, agent_state (last write wins),
-//      agent_messages rows.
+//      agent_messages rows, cost_traces row.
 //   7. Fire-and-forget Mem0 add for cross-conversation fact extraction.
 //
 // Supports POST { kind: "conflict_resolution", conflictId, choice } for the
@@ -20,20 +20,21 @@
 //
 // Supports POST { kind: "forget_everything" } to purge all user data.
 
+import "server-only";
 import { NextRequest } from "next/server";
 import { Runner } from "@openai/agents";
 import { ulid } from "ulid";
-import { z } from "zod";
 import { chiefOfStaff } from "@/lib/agents/specialists/chief-of-staff";
 import { deepseekModel, getResponseSync } from "@/lib/agents/model";
 import { memoryClient } from "@/lib/memory-client";
-import { pbAsAdmin } from "@/lib/pocketbase";
+import { createAdminSupabase } from "@/lib/supabase/admin";
 import { loadState, saveState, emptyCosState } from "@/lib/state";
 import { TraceStore, recordToolCall, commitTurn } from "@/lib/tracing";
 import type { ChatMessage } from "@/lib/types";
 import type { CosState, SSEEvent } from "@/lib/agent-types";
 
 export const runtime = "nodejs";
+export const maxDuration = 60; // Vercel Pro
 export const dynamic = "force-dynamic";
 
 const SMALL_TALK = /^(hi|hey|hello|yo|thanks|thank you|ok|okay|lol|bye|goodbye|good morning|good night|sup|hola)[\s!.]*$/i;
@@ -55,10 +56,8 @@ function bufferEvent(conversationId: string, event: SSEEvent): number {
   const id = sseSeq;
   const list = SSE_BUFFER.get(conversationId) ?? [];
   list.push({ id, conversationId, event });
-  // Trim oldest if too long
   if (list.length > SSE_BUFFER_MAX) list.splice(0, list.length - SSE_BUFFER_MAX);
   SSE_BUFFER.set(conversationId, list);
-  // Schedule cleanup
   setTimeout(() => {
     const cur = SSE_BUFFER.get(conversationId);
     if (cur) SSE_BUFFER.set(conversationId, cur.filter((e) => Date.now() - e.id < SSE_BUFFER_TTL_MS));
@@ -90,24 +89,25 @@ async function checkRateLimit(
   isSmallTalk: boolean
 ): Promise<{ ok: true } | { ok: false; reason: string; scope: "conv" | "user" }> {
   if (isSmallTalk) return { ok: true };
-  const pb = await pbAsAdmin();
-  const since = new Date(Date.now() - HOURLY_WINDOW_MS).toISOString();
+  const sb = createAdminSupabase();
+  const sinceIso = new Date(Date.now() - HOURLY_WINDOW_MS).toISOString();
   try {
-    const convCount = await pb.collection("messages").getList(1, 1, {
-      filter: `conversation_id="${conversationId}" && created >= "${since}" && role="user"`,
-    });
-    if (convCount.totalItems >= MAX_TURNS_PER_CONV_PER_HOUR) {
+    const { count: convCount } = await sb
+      .from("messages")
+      .select("id", { count: "exact", head: true })
+      .eq("conversation_id", conversationId)
+      .eq("role", "user")
+      .gte("created_at", sinceIso);
+    if ((convCount ?? 0) >= MAX_TURNS_PER_CONV_PER_HOUR) {
       return { ok: false, reason: "conversation rate limit exceeded (60/conv/hour)", scope: "conv" };
     }
-    // For per-user count, count distinct conversation_ids with user_id
-    const userCount = await pb.collection("conversations").getList(1, 1, {
-      filter: `user_id="${userId}"`,
-    });
-    // Fallback: count user messages across all their conversations
-    const allUserMsgs = await pb.collection("messages").getList(1, 1, {
-      filter: `created >= "${since}" && role="user"`,
-    });
-    if (allUserMsgs.totalItems >= MAX_TURNS_PER_USER_PER_HOUR) {
+    const { count: userCount } = await sb
+      .from("messages")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("role", "user")
+      .gte("created_at", sinceIso);
+    if ((userCount ?? 0) >= MAX_TURNS_PER_USER_PER_HOUR) {
       return { ok: false, reason: "user rate limit exceeded (200/user/hour)", scope: "user" };
     }
   } catch (err) {
@@ -166,12 +166,9 @@ export async function POST(req: NextRequest) {
     return new Response("Invalid JSON body", { status: 400 });
   }
 
-  // ── Resume branch: user picked from a ConflictCard ──
   if (body?.kind === "conflict_resolution") {
     return handleConflictResolution(body);
   }
-
-  // ── PII purge ──
   if (body?.kind === "forget_everything") {
     return handleForgetEverything(body);
   }
@@ -183,18 +180,21 @@ export async function POST(req: NextRequest) {
   // ── Conversation bootstrap ──
   let conversationId: string | null = body.conversationId ?? null;
   try {
-    const pb = await pbAsAdmin();
+    const sb = createAdminSupabase();
     if (!conversationId) {
-      const conv = await pb.collection("conversations").create({
-        user_id: userId,
-        title: message.slice(0, 60),
-      });
-      conversationId = conv.id;
+      const { data, error } = await sb
+        .from("conversations")
+        .insert({ user_id: userId, title: message.slice(0, 60) })
+        .select("id")
+        .single();
+      if (error) throw error;
+      conversationId = data.id;
     } else {
-      await pb.collection("conversations").update(conversationId, {});
+      // touch updated_at
+      await sb.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", conversationId);
     }
   } catch (err) {
-    console.error("[chat] PocketBase conv init failed", err);
+    console.error("[chat] Supabase conv init failed", err);
     return new Response("Database unavailable", { status: 503 });
   }
 
@@ -224,7 +224,6 @@ export async function POST(req: NextRequest) {
         const tokEvt: SSEEvent = { type: "token", delta: reply };
         const tokId = bufferEvent(conversationId!, tokEvt);
         controller.enqueue(sse.encode(tokId, tokEvt));
-        // Persist
         void persistAfterStream(conversationId!, userId, message, reply, turnId, null, []);
         const doneEvt: SSEEvent = { type: "done" };
         const doneId = bufferEvent(conversationId!, doneEvt);
@@ -251,7 +250,6 @@ export async function POST(req: NextRequest) {
     }),
   ]);
 
-  // ── Build the CoS input ──
   const cosSystem = buildCosSystemPrompt(
     chiefOfStaff.instructions ?? "",
     globalFactsRes.results,
@@ -268,17 +266,14 @@ export async function POST(req: NextRequest) {
     { role: "user", content: message + (docBlock ? `\n\n[Relevant documents]\n${docBlock}` : "") },
   ];
 
-  // ── Stream the CoS ──
   const runner = new Runner({ model: deepseekModel });
   const sse = makeSseWriter();
   const stream = new ReadableStream({
     async start(controller) {
-      // 0. Replay any buffered events if client resumed
       if (lastEventId > 0) {
         const replay = replaySince(conversationId!, lastEventId);
         for (const e of replay) controller.enqueue(sse.encode(e.id, e.event));
       }
-      // 1. meta event
       const metaEvt: SSEEvent = { type: "meta", conversationId, turnId };
       const metaId = bufferEvent(conversationId!, metaEvt);
       controller.enqueue(sse.encode(metaId, metaEvt));
@@ -289,7 +284,7 @@ export async function POST(req: NextRequest) {
       let firstDeltaAt: number | null = null;
       let lastDeltaAt: number | null = null;
       let streamBroke = false;
-      let toolStarts: Record<string, number> = {}; // toolName → start ms
+      let toolStarts: Record<string, number> = {};
 
       try {
         const runResult = runner.runStreamed(chiefOfStaff, inputItems, {
@@ -304,9 +299,6 @@ export async function POST(req: NextRequest) {
           },
         });
 
-        // Watchdog: if the SDK stream yields no deltas for ≥ 2 s, fall back
-        // to a non-streaming call. This is the SF-2/SF-3 fix from
-        // .trae/specs/fix-top3-broken.
         const STREAM_QUIET_MS = 2000;
         let watcher: NodeJS.Timeout | null = null;
         const startWatcher = () => {
@@ -314,7 +306,6 @@ export async function POST(req: NextRequest) {
           watcher = setTimeout(async () => {
             if (streamBroke) return;
             if (lastDeltaAt === null) {
-              // No delta ever arrived — call the non-streaming fallback.
               console.warn(`[chat] stream yielded no deltas within ${STREAM_QUIET_MS}ms; falling back to getResponseSync`);
               streamBroke = true;
               try {
@@ -333,7 +324,6 @@ export async function POST(req: NextRequest) {
                   const id = bufferEvent(conversationId!, t);
                   controller.enqueue(sse.encode(id, t));
                 }
-                // Commit trace for the fallback path
                 commitTurn({
                   turnId,
                   conversationId: conversationId!,
@@ -359,12 +349,6 @@ export async function POST(req: NextRequest) {
 
         try {
           for await (const event of runResult as any) {
-            // The OpenAI Agents SDK stream events shape:
-            //   - raw_model_stream_event (model streaming events, includes output_text_delta)
-            //   - run_item_stream_event (tool calls, tool results, messages)
-            //   - agent_updated_stream_event (handoffs)
-            //   - tool_call_*
-            // We translate each into SSE.
             if (event?.type === "raw_model_stream_event") {
               const raw = event?.data;
               if (raw?.type === "output_text_delta" && raw?.delta) {
@@ -372,7 +356,7 @@ export async function POST(req: NextRequest) {
                 assistantBuffer += raw.delta;
                 lastDeltaAt = Date.now();
                 if (firstDeltaAt === null) firstDeltaAt = lastDeltaAt;
-                startWatcher(); // reset the quiet-time watchdog
+                startWatcher();
                 const id = bufferEvent(conversationId!, t);
                 controller.enqueue(sse.encode(id, t));
               }
@@ -391,7 +375,6 @@ export async function POST(req: NextRequest) {
                 const id = bufferEvent(conversationId!, t);
                 controller.enqueue(sse.encode(id, t));
                 toolStarts[t.tool] = Date.now();
-                // Special-case consult_agent -> emit agent_message
                 if (t.tool === "consult_agent") {
                   const args: any = t.args ?? {};
                   const from = "CoS";
@@ -402,7 +385,6 @@ export async function POST(req: NextRequest) {
                   const amid = bufferEvent(conversationId!, am);
                   controller.enqueue(sse.encode(amid, am));
                 }
-                // Special-case run_code / compute -> emit code_run
                 if (t.tool === "run_code" || t.tool === "compute") {
                   const args: any = t.args ?? {};
                   const cr: SSEEvent = {
@@ -414,14 +396,10 @@ export async function POST(req: NextRequest) {
                   const crid = bufferEvent(conversationId!, cr);
                   controller.enqueue(sse.encode(crid, cr));
                 }
-                // Special-case resolve_conflict
                 if (t.tool === "resolve_conflict") {
-                  const args: any = t.args ?? {};
-                  if (args?.conflict_type === "values_tradeoff") {
-                    // We'll wait for the tool result to emit the conflict event
-                  }
+                  // Wait for the tool result to emit conflict
                 }
-              } else if (itype === "tool_result" || itype === "tool_result" || event?.name === "tool_call_done") {
+              } else if (itype === "tool_result" || event?.name === "tool_call_done") {
                 const result = item?.output ?? item?.result ?? item?.data;
                 const toolName = item?.name ?? item?.tool_name ?? "tool";
                 const t: SSEEvent = {
@@ -432,7 +410,6 @@ export async function POST(req: NextRequest) {
                 };
                 const id = bufferEvent(conversationId!, t);
                 controller.enqueue(sse.encode(id, t));
-                // TR-2: record the tool call for the trace
                 const toolStartedAt = toolStarts[toolName];
                 const toolDurationMs = toolStartedAt ? Date.now() - toolStartedAt : 0;
                 recordToolCall({
@@ -444,7 +421,6 @@ export async function POST(req: NextRequest) {
                   durationMs: toolDurationMs,
                 });
                 delete toolStarts[toolName];
-                // If resolve_conflict returned a values_tradeoff marker, emit `conflict`
                 if (
                   t.tool === "resolve_conflict" &&
                   result &&
@@ -460,27 +436,19 @@ export async function POST(req: NextRequest) {
                   conflictEmitted.value = true;
                   const cid = bufferEvent(conversationId!, c);
                   controller.enqueue(sse.encode(cid, c));
-                  // Note: we DO NOT emit a `done` here. The stream pauses until the
-                // user POSTs back with kind=conflict_resolution. But the
-                // ReadableStream's contract requires us to either close it or
-                // keep it open. We close it; the client knows the next message
-                // will be a `done` only when the CoS finishes the resumed turn.
-                // Actually, we must close here or the client will hang.
-                const doneEvt: SSEEvent = { type: "done" };
-                const did = bufferEvent(conversationId!, doneEvt);
-                controller.enqueue(sse.encode(did, doneEvt));
-                // TR-3: also commit a trace on the conflict-pause path
-                commitTurn({
-                  turnId,
-                  conversationId: conversationId!,
-                  userId,
-                  finalText: assistantBuffer,
-                  usage: { input: 0, output: Math.ceil(assistantBuffer.length / 4), reasoning: 0, estimated: true },
-                });
-                controller.close();
-                return;
+                  const doneEvt: SSEEvent = { type: "done" };
+                  const did = bufferEvent(conversationId!, doneEvt);
+                  controller.enqueue(sse.encode(did, doneEvt));
+                  commitTurn({
+                    turnId,
+                    conversationId: conversationId!,
+                    userId,
+                    finalText: assistantBuffer,
+                    usage: { input: 0, output: Math.ceil(assistantBuffer.length / 4), reasoning: 0, estimated: true },
+                  });
+                  controller.close();
+                  return;
                 }
-                // If resolve_conflict domain_internal/technical_factual -> emit conflict_resolved
                 if (
                   t.tool === "resolve_conflict" &&
                   result &&
@@ -500,15 +468,12 @@ export async function POST(req: NextRequest) {
                   const crid = bufferEvent(conversationId!, cr);
                   controller.enqueue(sse.encode(crid, cr));
                 }
-                // If consult_agent returned a reply, attach it to the last agent_message
                 if (t.tool === "consult_agent" && result && typeof result === "object") {
                   const last = agentMessages[agentMessages.length - 1];
                   if (last) {
                     last.reply = (result as any).reply ?? (result as any).error ?? "";
                   }
                 }
-              } else if (itype === "message_output" || itype === "message" || itype === "output_message") {
-                // Could be the final message; already streamed via raw_model_stream_event
               }
               continue;
             }
@@ -524,21 +489,16 @@ export async function POST(req: NextRequest) {
             }
           }
         } catch (streamErr: any) {
-          // SF-4: stream threw mid-loop
           console.error("[chat] CoS stream threw mid-loop:", streamErr);
           streamBroke = true;
           if (watcher) clearTimeout(watcher);
           const e: SSEEvent = { type: "error", message: streamErr?.message ?? String(streamErr) };
           const id = bufferEvent(conversationId!, e);
           controller.enqueue(sse.encode(id, e));
-          // Fall through to the persistence + trace commit below; the route
-          // will persist whatever partial text we already buffered.
         }
         if (watcher) clearTimeout(watcher);
         if (streamBroke) {
-          // The fallback already emitted `done` and closed the stream; or
-          // the catch block above emitted an error and we want to close.
-          if (!controller.desiredSize) return; // already closed
+          if (!controller.desiredSize) return;
           const doneEvt: SSEEvent = { type: "done" };
           const did = bufferEvent(conversationId!, doneEvt);
           try { controller.enqueue(sse.encode(did, doneEvt)); } catch {}
@@ -546,9 +506,7 @@ export async function POST(req: NextRequest) {
           return;
         }
 
-        // 2. Final assistant text may have been captured via deltas
         if (!assistantBuffer) {
-          // Fallback: try to read the run's finalOutput via a non-stream runner
           try {
             const final = await (runResult as any).completedPromise?.catch?.(() => null);
             if (final?.finalOutput) {
@@ -560,13 +518,11 @@ export async function POST(req: NextRequest) {
           } catch {}
         }
 
-        // 3. done event
         const doneEvt: SSEEvent = { type: "done" };
         const did = bufferEvent(conversationId!, doneEvt);
         controller.enqueue(sse.encode(did, doneEvt));
         controller.close();
 
-        // 4. Post-stream persistence (fire-and-await but doesn't block the SSE)
         try {
           await persistAfterStream(
             conversationId!,
@@ -581,9 +537,6 @@ export async function POST(req: NextRequest) {
           console.error("[chat] post-stream persist failed:", e);
         }
 
-        // 5. TR-3/4: Commit the trace for the success path. Tool calls
-        // have already been recorded via recordToolCall; commitTurn builds
-        // the final payload and writes the row.
         commitTurn({
           turnId,
           conversationId: conversationId!,
@@ -596,7 +549,6 @@ export async function POST(req: NextRequest) {
         const e: SSEEvent = { type: "error", message: err?.message ?? String(err) };
         const id = bufferEvent(conversationId!, e);
         controller.enqueue(sse.encode(id, e));
-        // Persist partial text + record failure
         try {
           await persistAfterStream(
             conversationId!,
@@ -608,7 +560,6 @@ export async function POST(req: NextRequest) {
             agentMessages
           );
         } catch {}
-        // TR-3: also commit a trace on the error path
         commitTurn({
           turnId,
           conversationId: conversationId!,
@@ -630,16 +581,19 @@ export async function POST(req: NextRequest) {
 // ─── Helpers ───────────────────────────────────────────────────────────────
 async function loadHistory(conversationId: string): Promise<ChatMessage[]> {
   try {
-    const pb = await pbAsAdmin();
-    const res = await pb.collection("messages").getList(1, 20, {
-      filter: `conversation_id="${conversationId}"`,
-      sort: "created",
-    });
-    return (res.items as ChatMessage[]).map((m) => ({
+    const sb = createAdminSupabase();
+    const { data, error } = await sb
+      .from("messages")
+      .select("id, role, content, created_at")
+      .eq("conversation_id", conversationId)
+      .order("created_at", { ascending: true })
+      .limit(20);
+    if (error) throw error;
+    return (data ?? []).map((m: any) => ({
       id: m.id,
-      role: m.role,
+      role: m.role as "user" | "assistant" | "system",
       content: m.content,
-      createdAt: m.createdAt,
+      createdAt: m.created_at,
     }));
   } catch (err) {
     console.warn("[chat] loadHistory failed:", err);
@@ -649,8 +603,7 @@ async function loadHistory(conversationId: string): Promise<ChatMessage[]> {
 
 async function loadStateSafe(conversationId: string, agentName: string): Promise<CosState | null> {
   try {
-    const pb = await pbAsAdmin();
-    return await loadState(pb, conversationId, agentName);
+    return await loadState(conversationId, agentName);
   } catch {
     return null;
   }
@@ -666,22 +619,12 @@ async function persistAfterStream(
   agentMessages: { from: string; to: string; message: string; reply?: string }[]
 ): Promise<void> {
   try {
-    const pb = await pbAsAdmin();
-    await pb.collection("messages").create({
-      conversation_id: conversationId,
-      role: "user",
-      content: userMsg,
-      memory_saved: false,
-    });
-    await pb.collection("messages").create({
-      conversation_id: conversationId,
-      role: "assistant",
-      content: assistantMsg,
-      memory_saved: false,
-    });
+    const sb = createAdminSupabase();
+    await sb.from("messages").insert([
+      { conversation_id: conversationId, user_id: userId, role: "user", content: userMsg, memory_saved: false },
+      { conversation_id: conversationId, user_id: userId, role: "assistant", content: assistantMsg, memory_saved: false },
+    ]);
 
-    // Persist agent_state (last write wins). The CoS may have called
-    // save_my_state, but as a safety net we bump the turn_count.
     const next: CosState = {
       ...(prevState ?? emptyCosState()),
       current_focus: prevState?.current_focus ?? deriveFocus(userMsg),
@@ -697,28 +640,25 @@ async function persistAfterStream(
       user_preferences_this_session: prevState?.user_preferences_this_session ?? {},
       turn_count: (prevState?.turn_count ?? 0) + 1,
     };
-    await saveState(pb, conversationId, "CoS", next);
+    await saveState(conversationId, "CoS", next);
 
-    // Persist A2A consults (the consult_agent tool already inserts rows, but
-    // we double-write via the `agent_messages` collection here for visibility
-    // in the Team Panel).
-    for (const m of agentMessages) {
+    if (agentMessages.length > 0) {
+      const rows = agentMessages.map((m) => ({
+        conversation_id: conversationId,
+        turn_id: turnId,
+        from_agent: m.from,
+        to_agent: m.to,
+        message: m.message,
+        reply: m.reply ?? "",
+        status: m.reply ? "replied" : "pending",
+      }));
       try {
-        await pb.collection("agent_messages").create({
-          conversation_id: conversationId,
-          turn_id: turnId,
-          from_agent: m.from,
-          to_agent: m.to,
-          message: m.message,
-          reply: m.reply ?? "",
-          status: m.reply ? "replied" : "pending",
-        });
+        await sb.from("agent_messages").insert(rows);
       } catch (e) {
         console.warn("[chat] persist agent_messages failed:", e);
       }
     }
 
-    // Fire-and-forget Mem0 add (do not await on the response)
     void memoryClient
       .addMemory(userId, [
         { role: "user", content: userMsg },
@@ -726,7 +666,6 @@ async function persistAfterStream(
       ])
       .catch((e) => console.warn("[chat] addMemory failed:", e));
 
-    // Fire-and-forget Qdrant message index (cross-conversation search)
     void memoryClient
       .indexMessage(userId, conversationId, ulid(), "user", userMsg)
       .catch((e) => console.warn("[chat] indexMessage user failed:", e));
@@ -740,7 +679,6 @@ async function persistAfterStream(
 }
 
 function deriveFocus(msg: string): string {
-  // Best-effort: take the first 80 chars as the focus for the next turn.
   return msg.slice(0, 80).replace(/\s+/g, " ").trim();
 }
 
@@ -771,24 +709,22 @@ async function handleConflictResolution(body: any): Promise<Response> {
   const turnId = ulid();
   const sse = makeSseWriter();
 
-  // Update the agent_messages row with the user's choice
   try {
-    const pb = await pbAsAdmin();
-    const rows = await pb.collection("agent_messages").getList(1, 1, {
-      filter: `conversation_id="${conversationId}" && message~"[values_tradeoff]"`,
-      sort: "-created",
-    });
-    if (rows.items[0]) {
-      await pb.collection("agent_messages").update(rows.items[0].id, {
+    const sb = createAdminSupabase();
+    await sb
+      .from("agent_messages")
+      .update({
         reply: `user_picked: ${choice} (conflictId=${conflictId})`,
         status: "replied",
-      });
-    }
+      })
+      .eq("conversation_id", conversationId)
+      .like("message", "[values_tradeoff]%")
+      .order("created_at", { ascending: false })
+      .limit(1);
   } catch (e) {
     console.warn("[chat] conflict_resolution persist failed:", e);
   }
 
-  // Re-invoke the CoS with a follow-up message
   const followUp = `The user picked option "${choice}" for the conflict. Continue with the previous task and cite their choice.`;
   const cosState = await loadStateSafe(conversationId, "CoS");
   const input: any[] = [{ role: "user", content: followUp }];
@@ -823,7 +759,6 @@ async function handleConflictResolution(body: any): Promise<Response> {
           },
           stream: true,
         } as any);
-        // SDK may give us a stream — try iterating
         if (Symbol.asyncIterator in Object(result)) {
           for await (const chunk of result as any) {
             const delta = chunk?.choices?.[0]?.delta?.content;
@@ -873,36 +808,32 @@ async function handleForgetEverything(body: any): Promise<Response> {
   const userId: string = body.userId || process.env.USER_ID || "local-user";
   const results: Record<string, string> = {};
   try {
-    // Clear Mem0 episodic
     try {
       await memoryClient.clearMemories(userId);
       results.mem0 = "cleared";
     } catch (e) {
       results.mem0 = `error: ${(e as Error).message}`;
     }
-    // Clear Mem0 global
     try {
       await memoryClient.clearGlobalMemories(userId);
       results.mem0_global = "cleared";
     } catch (e) {
       results.mem0_global = `error: ${(e as Error).message}`;
     }
-    // Delete conversations + messages + agent_state + agent_messages
     try {
-      const pb = await pbAsAdmin();
-      const convs = await pb.collection("conversations").getFullList({ filter: `user_id="${userId}"` });
-      for (const c of convs) {
-        const msgs = await pb.collection("messages").getFullList({ filter: `conversation_id="${c.id}"` });
-        for (const m of msgs) await pb.collection("messages").delete(m.id);
-        const states = await pb.collection("agent_state").getFullList({ filter: `conversation_id="${c.id}"` });
-        for (const s of states) await pb.collection("agent_state").delete(s.id);
-        const a2a = await pb.collection("agent_messages").getFullList({ filter: `conversation_id="${c.id}"` });
-        for (const a of a2a) await pb.collection("agent_messages").delete(a.id);
-        await pb.collection("conversations").delete(c.id);
-      }
-      results.pocketbase = "purged";
+      const sb = createAdminSupabase();
+      // CASCADE handles messages / agent_state / agent_messages.
+      const { error } = await sb.from("conversations").delete().eq("user_id", userId);
+      if (error) throw error;
+      results.supabase = "purged";
     } catch (e) {
-      results.pocketbase = `error: ${(e as Error).message}`;
+      results.supabase = `error: ${(e as Error).message}`;
+    }
+    try {
+      await memoryClient.clearMessages(userId);
+      results.message_index = "cleared";
+    } catch (e) {
+      results.message_index = `error: ${(e as Error).message}`;
     }
   } catch (err) {
     return new Response(JSON.stringify({ error: String(err), results }), {

@@ -8,12 +8,12 @@
  *   3. Updates the row with the reply (status=replied).
  *   4. Enforces a 3-deep loop guard and a 4-consult/turn budget.
  */
+import "server-only";
 import { tool } from "@openai/agents";
 import { z } from "zod";
 import { ulid } from "ulid";
 import { Runner } from "@openai/agents";
 import { deepseekModel, type ReasoningMode } from "@/lib/agents/model";
-import { pbAsAdmin } from "@/lib/pocketbase";
 import {
   postMessage,
   markReplied,
@@ -55,7 +55,6 @@ export function getConsultTool(importAgent: (name: string) => Promise<any>) {
     }),
     async execute({ agent_name, message }, runContext?: any) {
       const ctx: ConsultContext = runContext?.context ?? {};
-      const pb = pbAsAdmin();
 
       // ── Loop guard ──
       if ((ctx.a2aDepth ?? 0) >= DEPTH_LIMIT) {
@@ -70,7 +69,7 @@ export function getConsultTool(importAgent: (name: string) => Promise<any>) {
       }
 
       // ── Persist the consult ──
-      const row = await postMessage(pb, {
+      const row = await postMessage({
         conversation_id: ctx.conversationId ?? "unknown",
         turn_id: ctx.turnId ?? ulid(),
         from_agent: ctx.fromAgent ?? "unknown",
@@ -94,11 +93,11 @@ export function getConsultTool(importAgent: (name: string) => Promise<any>) {
           typeof (result as any).finalOutput === "string"
             ? (result as any).finalOutput
             : JSON.stringify((result as any).finalOutput ?? "");
-        await markReplied(pb, row.id, reply);
+        await markReplied(row.id, reply);
         return { agent: agent_name, reply };
       } catch (err: any) {
         const errMsg = err?.message ?? String(err);
-        await markErrored(pb, row.id, errMsg);
+        await markErrored(row.id, errMsg);
         return { agent: agent_name, error: errMsg };
       }
     },

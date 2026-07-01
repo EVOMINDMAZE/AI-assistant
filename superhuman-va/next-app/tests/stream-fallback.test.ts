@@ -43,14 +43,17 @@ vi.mock("@/lib/memory-client", () => ({
   },
 }));
 
-vi.mock("@/lib/pocketbase", () => ({
-  pbAsAdmin: vi.fn().mockResolvedValue({
-    collection: () => ({
-      getList: vi.fn().mockResolvedValue({ items: [], totalItems: 0 }),
-      create: vi.fn().mockResolvedValue({ id: "c1" }),
-      update: vi.fn(),
-      getFullList: vi.fn().mockResolvedValue([]),
-      delete: vi.fn(),
+vi.mock("@/lib/supabase/admin", () => ({
+  createAdminSupabase: () => ({
+    from: () => ({
+      insert: vi.fn().mockResolvedValue({ data: { id: "c1" }, error: null }),
+      select: () => ({
+        eq: () => ({ maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }), single: vi.fn().mockResolvedValue({ data: null, error: null }) }),
+        order: () => ({ limit: vi.fn().mockResolvedValue({ data: [], error: null }) }),
+      }),
+      update: () => ({ eq: () => ({ select: vi.fn().mockResolvedValue({ data: null, error: null }) }) }),
+      delete: () => ({ eq: vi.fn().mockResolvedValue({ data: [], error: null }) }),
+      upsert: vi.fn().mockResolvedValue({ error: null }),
     }),
   }),
 }));

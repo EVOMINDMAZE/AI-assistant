@@ -275,7 +275,10 @@ export default function ChatPage() {
 
   const handleSignOut = useCallback(async () => {
     try {
-      await fetch("/api/auth", { method: "DELETE" });
+      // Supabase Auth — clears the session cookie.
+      const { createBrowserSupabase } = await import("@/lib/supabase/client");
+      const sb = createBrowserSupabase();
+      await sb.auth.signOut();
     } catch (err) {
       console.warn("sign-out failed:", err);
     } finally {

@@ -4,11 +4,11 @@
  * Provides a per-specialist `consultAgent` tool that wraps the global
  * `getConsultTool` with this specialist's "from" name baked in.
  */
+import "server-only";
 import { tool } from "@openai/agents";
 import { z } from "zod";
 import { Runner } from "@openai/agents";
 import { deepseekModel, type ReasoningMode } from "@/lib/agents/model";
-import { pbAsAdmin } from "@/lib/pocketbase";
 import { postMessage, markReplied, markErrored } from "@/lib/messaging";
 import { AGENT_NAMES } from "@/lib/agent-types";
 
@@ -31,8 +31,7 @@ export function consultAgent(importAgent: (name: string) => Promise<any>, fromNa
       if ((ctx.a2aConsultsThisTurn ?? 0) >= BUDGET_PER_TURN) return { error: "consult budget exceeded (4/turn)" };
       if (!AGENT_NAMES.includes(agent_name as any)) return { error: `unknown agent: ${agent_name}` };
 
-      const pb = pbAsAdmin();
-      const row = await postMessage(pb, {
+      const row = await postMessage({
         conversation_id: ctx.conversationId ?? "unknown",
         turn_id: ctx.turnId ?? "unknown",
         from_agent: fromName,
@@ -55,11 +54,11 @@ export function consultAgent(importAgent: (name: string) => Promise<any>, fromNa
           typeof (result as any).finalOutput === "string"
             ? (result as any).finalOutput
             : JSON.stringify((result as any).finalOutput ?? "");
-        await markReplied(pb, row.id, reply);
+        await markReplied(row.id, reply);
         return { agent: agent_name, reply };
       } catch (err: any) {
         const errMsg = err?.message ?? String(err);
-        await markErrored(pb, row.id, errMsg);
+        await markErrored(row.id, errMsg);
         return { agent: agent_name, error: errMsg };
       }
     },

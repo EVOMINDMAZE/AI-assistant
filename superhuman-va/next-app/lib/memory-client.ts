@@ -1,180 +1,245 @@
-// Thin fetch wrapper around the memory-service API.
-import type { DocumentHit, DocumentMeta, MemoryHit } from "./types";
+// lib/memory-client.ts — Supabase-backed in-process memory client.
+//
+// Replaces the previous fetch-based wrapper around the FastAPI
+// memory-service. Same public surface; the body now calls
+// `lib/supabase/{admin,vector}.ts` and `lib/embedding.ts` directly.
+//
+// Every method is an `async` function; signatures match the old client.
 
-const BASE = process.env.MEMORY_SERVICE_URL ?? "http://localhost:8000";
+import "server-only";
+import { ulid } from "ulid";
+import { createAdminSupabase } from "@/lib/supabase/admin";
+import {
+  upsertMemory,
+  searchMemories,
+  listMemories,
+  clearMemories as clearMemoriesTable,
+  upsertDocument,
+  searchDocuments,
+  listDocuments,
+  deleteDocument,
+  indexMessage as indexMessageTable,
+  searchMessages,
+  clearMessages as clearMessagesTable,
+  type MemoryHit,
+  type DocumentHit,
+  type MessageIndexHit,
+} from "@/lib/supabase/vector";
+import { embed } from "@/lib/embedding";
 
-async function jsonFetch<T>(path: string, init: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init.headers ?? {}),
-    },
-    cache: "no-store",
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`memory-service ${path} ${res.status}: ${text}`);
-  }
-  return res.json() as Promise<T>;
-}
+export type { MemoryHit, DocumentHit, MessageIndexHit };
 
 export interface SearchMemoryResponse {
   results: MemoryHit[];
 }
-
 export interface SearchDocumentsResponse {
   results: DocumentHit[];
 }
-
 export interface ListMemoriesResponse {
   results: MemoryHit[];
 }
-
 export interface ListDocumentsResponse {
-  results: DocumentMeta[];
+  results: { id: string; filename: string; metadata: Record<string, unknown>; created_at: string }[];
 }
-
-export interface GlobalMemoryHit {
-  id: string;
-  fact: string;
-  score?: number;
-  metadata?: Record<string, unknown>;
-}
-
 export interface ListGlobalMemoryResponse {
-  results: GlobalMemoryHit[];
+  results: MemoryHit[];
+}
+export interface GlobalMemoryHit extends MemoryHit {}
+
+function getSb() {
+  return createAdminSupabase();
+}
+
+// ── Mem0-style episodic memory ──────────────────────────────────────────────
+// Heuristic: extract a few short facts from the most recent user message.
+// Real Mem0 would do this with an LLM; we use a simple sentence splitter
+// for now to avoid one extra LLM call per turn. Replace with Mem0 Cloud
+// or a local extraction agent if quality is insufficient.
+function extractFactsFromMessages(
+  messages: { role: string; content: string }[]
+): string[] {
+  const facts: string[] = [];
+  for (const m of messages) {
+    if (m.role !== "user") continue;
+    // Naive: split on sentence-ending punctuation, drop trivial short ones.
+    const sentences = m.content
+      .split(/(?<=[.!?])\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 8 && s.length <= 200);
+    facts.push(...sentences.slice(0, 3));
+  }
+  return facts;
 }
 
 export const memoryClient = {
-  searchMemory(
-    userId: string,
-    query: string,
-    limit = 5,
-    threshold = 0.3
-  ): Promise<SearchMemoryResponse> {
-    return jsonFetch("/search_memory", {
-      method: "POST",
-      body: JSON.stringify({ user_id: userId, query, limit, threshold }),
-    });
-  },
-
-  searchDocuments(
-    userId: string,
-    query: string,
-    limit = 5
-  ): Promise<SearchDocumentsResponse> {
-    return jsonFetch("/search_documents", {
-      method: "POST",
-      body: JSON.stringify({ user_id: userId, query, limit }),
-    });
-  },
-
-  listMemories(userId: string): Promise<ListMemoriesResponse> {
-    return jsonFetch(`/list_memories?user_id=${encodeURIComponent(userId)}`, {
-      method: "GET",
-    });
-  },
-
-  clearMemories(userId: string): Promise<unknown> {
-    return jsonFetch(`/clear_memories?user_id=${encodeURIComponent(userId)}`, {
-      method: "DELETE",
-    });
-  },
-
-  listDocuments(userId: string): Promise<ListDocumentsResponse> {
-    return jsonFetch(`/list_documents?user_id=${encodeURIComponent(userId)}`, {
-      method: "GET",
-    });
-  },
-
-  deleteDocument(userId: string, docId: string): Promise<unknown> {
-    return jsonFetch(
-      `/delete_document?user_id=${encodeURIComponent(userId)}&doc_id=${encodeURIComponent(docId)}`,
-      { method: "DELETE" }
-    );
-  },
-
-  // Fire-and-forget: caller does not await. We do still need to
-  // construct the promise to start the fetch, but callers should
-  // intentionally drop it.
-  addMemory(
+  // ── episodic (Mem0-style) ────────────────────────────────────────────────
+  async addMemory(
     userId: string,
     messages: { role: "user" | "assistant" | "system"; content: string }[]
   ): Promise<unknown> {
-    return jsonFetch("/add_memory", {
-      method: "POST",
-      body: JSON.stringify({ user_id: userId, messages }),
-    });
+    const sb = getSb();
+    const facts = extractFactsFromMessages(messages);
+    const results: string[] = [];
+    for (const fact of facts) {
+      const emb = await embed(fact);
+      const id = await upsertMemory(sb, {
+        userId,
+        fact,
+        embedding: emb,
+        isGlobal: false,
+      });
+      results.push(id);
+    }
+    return { inserted: results.length, ids: results };
   },
 
-  // ── Global memory (cross-conversation, never pruned) ─
+  async searchMemory(
+    userId: string,
+    query: string,
+    limit = 5,
+    threshold = 0.5
+  ): Promise<SearchMemoryResponse> {
+    const sb = getSb();
+    const emb = await embed(query);
+    const hits = await searchMemories(sb, userId, emb, limit, threshold);
+    return { results: hits.filter((h) => !h.is_global) };
+  },
 
-  addGlobalMemory(
+  async listMemories(userId: string): Promise<ListMemoriesResponse> {
+    const sb = getSb();
+    const rows = await listMemories(sb, userId, { globalOnly: false });
+    return { results: rows };
+  },
+
+  async clearMemories(userId: string): Promise<unknown> {
+    const sb = getSb();
+    const n = await clearMemoriesTable(sb, userId, { globalOnly: false });
+    return { deleted: n };
+  },
+
+  // ── global (cross-conversation, never pruned) ────────────────────────────
+  async addGlobalMemory(
     userId: string,
     fact: string,
     metadata?: Record<string, unknown>
   ): Promise<unknown> {
-    return jsonFetch("/add_global_memory", {
-      method: "POST",
-      body: JSON.stringify({ user_id: userId, fact, metadata }),
+    const sb = getSb();
+    const emb = await embed(fact);
+    const id = await upsertMemory(sb, {
+      userId,
+      fact,
+      embedding: emb,
+      metadata: metadata ?? {},
+      isGlobal: true,
     });
+    return { id };
   },
 
-  searchGlobalMemory(
+  async searchGlobalMemory(
     userId: string,
     query: string,
     limit = 5
   ): Promise<{ results: GlobalMemoryHit[] }> {
-    return jsonFetch("/search_global_memory", {
-      method: "POST",
-      body: JSON.stringify({ user_id: userId, query, limit }),
+    const sb = getSb();
+    const emb = await embed(query);
+    const hits = await searchMemories(sb, userId, emb, limit);
+    return { results: hits.filter((h) => h.is_global) };
+  },
+
+  async listGlobalMemories(userId: string): Promise<ListGlobalMemoryResponse> {
+    const sb = getSb();
+    const rows = await listMemories(sb, userId, { globalOnly: true });
+    return { results: rows };
+  },
+
+  async clearGlobalMemories(userId: string): Promise<unknown> {
+    const sb = getSb();
+    const n = await clearMemoriesTable(sb, userId, { globalOnly: true });
+    return { deleted: n };
+  },
+
+  // ── documents ────────────────────────────────────────────────────────────
+  async searchDocuments(
+    userId: string,
+    query: string,
+    limit = 5
+  ): Promise<SearchDocumentsResponse> {
+    const sb = getSb();
+    const emb = await embed(query);
+    const rows = await searchDocuments(sb, userId, emb, limit);
+    return { results: rows };
+  },
+
+  async listDocuments(userId: string): Promise<ListDocumentsResponse> {
+    const sb = getSb();
+    const rows = await listDocuments(sb, userId);
+    return { results: rows };
+  },
+
+  async addDocument(
+    userId: string,
+    filename: string,
+    content: string,
+    metadata?: Record<string, unknown>
+  ): Promise<{ id: string }> {
+    const sb = getSb();
+    const emb = await embed(content.slice(0, 2000));
+    const id = await upsertDocument(sb, {
+      userId,
+      filename,
+      content,
+      embedding: emb,
+      metadata: metadata ?? {},
     });
+    return { id };
   },
 
-  listGlobalMemories(userId: string): Promise<ListGlobalMemoryResponse> {
-    return jsonFetch(
-      `/list_global_memory?user_id=${encodeURIComponent(userId)}`,
-      { method: "GET" }
-    );
+  async deleteDocument(userId: string, docId: string): Promise<unknown> {
+    const sb = getSb();
+    await deleteDocument(sb, userId, docId);
+    return { ok: true };
   },
 
-  clearGlobalMemories(userId: string): Promise<unknown> {
-    return jsonFetch(
-      `/clear_global_memory?user_id=${encodeURIComponent(userId)}`,
-      { method: "DELETE" }
-    );
-  },
-
-  // ── Message index (cross-conversation search of past chats) ─
-
-  indexMessage(
+  // ── message index (cross-conversation search) ────────────────────────────
+  async indexMessage(
     userId: string,
     conversationId: string,
     messageId: string,
     role: "user" | "assistant" | "system",
     text: string
   ): Promise<unknown> {
-    return jsonFetch("/index_message", {
-      method: "POST",
-      body: JSON.stringify({ user_id: userId, conversation_id: conversationId, message_id: messageId, role, text }),
+    const sb = getSb();
+    const emb = await embed(text.slice(0, 2000));
+    const id = await indexMessageTable(sb, {
+      userId,
+      conversationId,
+      messageId,
+      role,
+      text,
+      embedding: emb,
     });
+    return { id };
   },
 
-  searchMessages(
+  async searchMessages(
     userId: string,
     query: string,
     limit = 5
-  ): Promise<{ results: { id: string; conversation_id: string; message_id: string; role: string; text: string; score: number }[] }> {
-    return jsonFetch("/search_messages", {
-      method: "POST",
-      body: JSON.stringify({ user_id: userId, query, limit }),
-    });
+  ): Promise<{ results: MessageIndexHit[] }> {
+    const sb = getSb();
+    const emb = await embed(query);
+    const hits = await searchMessages(sb, userId, emb, limit);
+    return { results: hits };
   },
 
-  clearMessages(userId: string): Promise<unknown> {
-    return jsonFetch(`/clear_messages?user_id=${encodeURIComponent(userId)}`, {
-      method: "DELETE",
-    });
+  async clearMessages(userId: string): Promise<unknown> {
+    const sb = getSb();
+    const n = await clearMessagesTable(sb, userId);
+    return { deleted: n };
   },
 };
+
+/** Generate a new message id (ULID). */
+export function newMessageId(): string {
+  return ulid();
+}

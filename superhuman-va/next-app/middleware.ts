@@ -1,35 +1,67 @@
 /**
- * middleware.ts — gate the chat UI behind the session cookie.
+ * Next.js middleware — enforces Supabase Auth on protected routes.
  *
- * Unauthenticated requests to /chat (and any sub-route) are redirected to
- * /login. The /api/auth endpoint is allowed through.
+ * Unauthenticated requests to `/chat` (and any other protected path) are
+ * redirected to `/login`. The `?next=` query param is preserved so the
+ * login page can send the user back to the page they were trying to view.
  */
-import { NextRequest, NextResponse } from "next/server";
+import { createServerClient } from "@supabase/ssr";
+import { NextResponse, type NextRequest } from "next/server";
 
-const COOKIE_NAME = "va_session";
+const PROTECTED_PREFIXES = ["/chat", "/settings", "/conversations"];
+const PUBLIC_PATHS = ["/login", "/auth/callback", "/api/cron"];
 
-export function middleware(req: NextRequest) {
-  const { pathname } = req.nextUrl;
+export async function middleware(req: NextRequest) {
+  const { pathname, search } = req.nextUrl;
+
+  // Allow public paths through unconditionally.
+  if (PUBLIC_PATHS.some((p) => pathname.startsWith(p))) {
+    return NextResponse.next();
+  }
+  // Static assets / Next internals.
   if (
-    pathname.startsWith("/login") ||
-    pathname.startsWith("/api/auth") ||
     pathname.startsWith("/_next") ||
-    pathname.startsWith("/favicon")
+    pathname.startsWith("/favicon") ||
+    pathname.startsWith("/api/health") ||
+    pathname.includes(".")
   ) {
     return NextResponse.next();
   }
-  const cookieHeader = req.headers.get("cookie") ?? "";
-  const hasSession = new RegExp(`(?:^|;\\s*)${COOKIE_NAME}=`).test(cookieHeader);
-  if (hasSession) return NextResponse.next();
-  if (pathname.startsWith("/api/")) {
-    return new NextResponse(JSON.stringify({ error: "Unauthorized" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
+
+  // Build a Supabase client that reads/writes the session cookie.
+  const res = NextResponse.next();
+  const sb = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        get(name) {
+          return req.cookies.get(name)?.value;
+        },
+        set(name, value, options) {
+          req.cookies.set({ name, value, ...options });
+          res.cookies.set({ name, value, ...options });
+        },
+        remove(name, options) {
+          req.cookies.set({ name, value: "", ...options });
+          res.cookies.set({ name, value: "", ...options });
+        },
+      },
+    }
+  );
+
+  const {
+    data: { user },
+  } = await sb.auth.getUser();
+
+  if (!user && PROTECTED_PREFIXES.some((p) => pathname.startsWith(p))) {
+    const url = req.nextUrl.clone();
+    url.pathname = "/login";
+    url.searchParams.set("next", pathname + (search || ""));
+    return NextResponse.redirect(url);
   }
-  const loginUrl = req.nextUrl.clone();
-  loginUrl.pathname = "/login";
-  return NextResponse.redirect(loginUrl);
+
+  return res;
 }
 
 export const config = {

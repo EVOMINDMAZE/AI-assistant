@@ -4,10 +4,10 @@
  * The `agent_name` parameter is set by the registry when the specialist is
  * registered, so the agent doesn't need to know its own name.
  */
+import "server-only";
 import { tool } from "@openai/agents";
 import { z } from "zod";
 import { loadState, saveState } from "@/lib/state";
-import { pbAsAdmin } from "@/lib/pocketbase";
 import type { CosState } from "@/lib/agent-types";
 
 export const loadMyState = tool({
@@ -22,8 +22,7 @@ export const loadMyState = tool({
     agent_name: z.string().describe("This agent's name (e.g. 'CoS', 'CTO')."),
   }),
   async execute({ conversation_id, agent_name }) {
-    const pb = pbAsAdmin();
-    const state = await loadState(pb, conversation_id, agent_name);
+    const state = await loadState(conversation_id, agent_name);
     return state ?? null;
   },
 });
@@ -40,8 +39,7 @@ export const saveMyState = tool({
     state: z.record(z.string(), z.any()).describe("The full state JSON to persist."),
   }),
   async execute({ conversation_id, agent_name, state }) {
-    const pb = pbAsAdmin();
-    await saveState(pb, conversation_id, agent_name, state as CosState);
+    await saveState(conversation_id, agent_name, state as CosState);
     return { saved: true };
   },
 });
