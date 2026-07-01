@@ -6,8 +6,9 @@ services:
     container_name: va-pocketbase
     restart: unless-stopped
     command: ["/pocketbase", "serve", "--http=0.0.0.0:8090"]
-    ports:
-      - "${PB_PORT:-8090}:8090"
+    # Internal only — proxied to the public via Caddy.
+    expose:
+      - "8090"
     volumes:
       - pb_data:/pb_data
     environment:
@@ -26,9 +27,10 @@ services:
     image: qdrant/qdrant:v1.12.0
     container_name: va-qdrant
     restart: unless-stopped
-    ports:
-      - "${QDRANT_PORT:-6333}:6333"
-      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    # Qdrant is NEVER reachable from the public internet.
+    expose:
+      - "6333"
+      - "6334"
     volumes:
       - qdrant_storage:/qdrant/storage
     environment:
@@ -48,8 +50,9 @@ services:
       dockerfile: Dockerfile
     container_name: va-memory-service
     restart: unless-stopped
-    ports:
-      - "${MEMORY_PORT:-8000}:8000"
+    # Internal only — proxied to the public via Caddy.
+    expose:
+      - "8000"
     environment:
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - USER_ID=${USER_ID:-local-user}
@@ -61,7 +64,11 @@ services:
       - POCKETBASE_URL=http://pocketbase:8090
       - POCKETBASE_ADMIN_EMAIL=${PB_ADMIN_EMAIL}
       - POCKETBASE_ADMIN_PASSWORD=${PB_ADMIN_PASSWORD}
-      - CORS_ORIGINS=http://localhost:${NEXT_PORT:-3000}
+      # In the production layout Caddy terminates TLS and every
+      # backend lives on the same origin, so CORS is wide-open
+      # inside the Docker network. Tighten if you ever expose
+      # this to a browser directly.
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
     volumes:
       - hf_cache:/app/.cache/huggingface
     depends_on:
@@ -78,10 +85,67 @@ services:
     networks:
       - va-net
 
+  next-app:
+    build:
+      context: ./next-app
+      dockerfile: Dockerfile
+    container_name: va-next-app
+    restart: unless-stopped
+    # Internal only — proxied to the public via Caddy.
+    expose:
+      - "3000"
+    environment:
+      - NODE_ENV=production
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - USER_ID=${USER_ID:-local-user}
+      - MEMORY_SERVICE_URL=http://memory-service:8000
+      - NEXT_PUBLIC_PB_URL=http://pocketbase:8090
+      - PB_ADMIN_EMAIL=${PB_ADMIN_EMAIL}
+      - PB_ADMIN_PASSWORD=${PB_ADMIN_PASSWORD}
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-https://${ORACLE_IP:-localhost}}
+    depends_on:
+      memory-service:
+        condition: service_healthy
+      pocketbase:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - va-net
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: va-caddy
+    restart: unless-stopped
+    # Caddy is the ONLY service with host port bindings.
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/cert.pem:/etc/caddy/cert.pem:ro
+      - ./caddy/key.pem:/etc/caddy/key.pem:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - next-app
+      - pocketbase
+      - memory-service
+    networks:
+      - va-net
+
 volumes:
   pb_data:
   qdrant_storage:
   hf_cache:
+  caddy_data:
+  caddy_config:
 
 networks:
   va-net:

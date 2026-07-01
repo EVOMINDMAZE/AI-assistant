@@ -4,11 +4,11 @@
 
 Your existing repo is already 90% cloud-ready. The pieces that need to change for an Oracle ARM A1 deployment with IP-only + self-signed:
 
-1. **Add a Next.js Docker service** — currently `npm run dev` runs on the host; on the server we want everything in `docker compose`.
-2. **Add a Caddy reverse-proxy service** — terminates self-signed TLS, routes `/`, `/pb/*`, `/ms/*` to the right backends.
-3. **Generate a self-signed cert for the Oracle public IP** — one `openssl` command at setup time.
-4. **Update the Caddy origin URL inside the memory service** so PB admin links work correctly when reverse-proxied.
-5. **Harden the host** — Oracle Security List (firewall), SSH key-only, fail2ban, automatic security updates.
+1. **Provision a brand-new VCN + ARM A1 instance** in Oracle Cloud — fully isolated from your existing project. No resource sharing, no port collisions, no shared Security Lists.
+2. **Add a Next.js Docker service** — currently `npm run dev` runs on the host; on the server we want everything in `docker compose`.
+3. **Add a Caddy reverse-proxy service** — terminates self-signed TLS, routes `/`, `/pb/*`, `/ms/*` to the right backends.
+4. **Generate a self-signed cert for the Oracle public IP** — one `openssl` command at setup time.
+5. **Harden the host** — Security List (firewall), SSH key-only, fail2ban, automatic security updates.
 
 Everything else (Mem0, Qdrant, PocketBase, FastEmbed) runs as-is. ARM Ampere A1 has 24 GB RAM and 4 OCPU — this stack uses < 2 GB at idle, so no memory tuning or swap is needed.
 
@@ -63,22 +63,65 @@ Caddy is the only thing the public internet talks to. Port 80 is open only to re
 
 ## 2. Prerequisites (one-time, on the Oracle console)
 
-### 2.1 Provision the instance
+The strategy is **full isolation**: the VA lives in its own VCN, subnet, Security List, and ARM instance. Nothing is shared with your existing project.
+
+### 2.0 Check your free-tier ARM budget
+
+Oracle's "always free" ARM A1 budget is **per tenancy, not per instance** — 4 OCPU + 24 GB RAM total across all ARM A1 instances in the compartment.
+
+In the console: **Compute → Instances** → look at the **OCPU** and **Memory** columns of your existing instance. Subtract from 4 / 24 GB. Whatever's left is what the VA can use. This stack idles at ~1 GB RAM and 0.2 OCPU, so even if your existing project takes 2 OCPU + 8 GB, you have plenty of headroom.
+
+If the existing project already maxes out 4 OCPU / 24 GB, you cannot run another ARM A1 — you'd have to fall back to the AMD micro free tier (1/8 OCPU + 1 GB), which is too tight for this stack. (Workarounds: move some workload off the existing project, or upgrade to a paid shape.)
+
+### 2.1 Create a new VCN
+
+In the console, **Networking → Virtual Cloud Networks → Start VCN Wizard → Create VCN with Internet Connectivity**:
 
 | Setting | Value |
 |---|---|
+| Name | `va-vcn` (or anything distinct from the existing one) |
+| IPv4 CIDR block | `10.1.0.0/16` (or any `/16` that doesn't collide with your existing VCN's `10.0.0.0/16`) |
+| IPv6 | Disabled (not needed) |
+| Public subnet CIDR | `10.1.0.0/24` |
+| Private subnet CIDR | Skip — not needed for this MVP |
+| DNS resolution | Use Oracle's default DNS |
+
+The wizard auto-creates:
+- An Internet Gateway
+- A route table for the public subnet
+- A default Security List (we'll customize it in 2.3)
+
+> **Note:** VCNs in the same tenancy are not peered by default. Your new VCN and the existing VCN have **zero network connectivity** between them. That's exactly what we want.
+
+### 2.2 Provision a new ARM instance
+
+**Compute → Instances → Create instance**:
+
+| Setting | Value |
+|---|---|
+| Name | `va-instance` |
+| Compartment | Same as the VCN (default root) |
+| Placement | Any availability domain |
+| Image | Oracle Linux 8/9 aarch64 (or **Oracle Linux 9 arm64** if listed) — avoid x86 images; the `python:3.11-slim` and `node:20-alpine` Docker images are multi-arch, but starting on aarch64 avoids surprises. |
 | Shape | `VM.Standard.A1.Flex` |
-| OCPU | 4 (max free) |
-| RAM | 24 GB (max free) |
-| OS | Oracle Linux 8/9 aarch64, **or** Ubuntu 22.04 LTS aarch64 |
+| OCPU | Whatever the budget in 2.0 allows (start with 2, leave room to grow) |
+| RAM | 12 GB (or remaining budget) |
 | Boot volume | 100 GB (default 47 GB is fine, but 100 GB leaves headroom for Qdrant snapshots) |
-| Public IP | Ephemeral (free) — note the IPv4 |
+| Networking | Attach the **new VCN's** public subnet from 2.1 |
+| Public IP | **Assign a new ephemeral public IPv4** — note this address. It is different from the existing project's IP. |
+| SSH key | Upload your public key (or generate a new keypair) |
 
-If you don't already have an ARM instance, the AMD x86 micro (1 GB) is too tight. The ARM one is the right shape. Always-free is genuinely always-free in us-ashburn / us-phoenix / eu-frankfurt / etc.
+Click **Create**. Provisioning takes ~2 minutes.
 
-### 2.2 Open the Security List (Oracle VCN firewall)
+> **Why a new instance instead of putting the VA on the existing one?**
+> - The existing instance has a fixed size and may already be at 4 OCPU / 24 GB.
+> - A separate instance gives the VA its own Security List — you only open 22/80/443 to your IP and nothing else; the existing project's ports stay untouched.
+> - Different public IP — you can take the VA down without affecting the other project.
+> - Different failure domain — one instance dying doesn't take both projects offline.
 
-Add ingress rules in the VCN's default Security List for the instance's subnet:
+### 2.3 Open the Security List for the new VCN
+
+The wizard created a default Security List attached to the new public subnet. Find it: **Networking → Virtual Cloud Networks → `va-vcn` → Subnets → public subnet → Default Security List for va-vcn → Add Ingress Rules**:
 
 | Protocol | Port | Source | Purpose |
 |---|---|---|---|
@@ -86,17 +129,26 @@ Add ingress rules in the VCN's default Security List for the instance's subnet:
 | TCP | 80 | `0.0.0.0/0` | Caddy → 443 redirect |
 | TCP | 443 | `0.0.0.0/0` | Caddy TLS termination |
 
-Do NOT open 8090, 8000, 6333, or 3000 at the Security List level. They stay bound to the Docker bridge network only.
+Do **not** open 8090, 8000, 6333, or 3000 at the Security List level. Those stay bound to the Docker bridge network only.
 
-### 2.3 SSH in and set up the user
+Egress is open by default (Oracle's default Security List allows all egress) — leave it as-is so the instance can reach DeepSeek's API and Docker Hub.
+
+### 2.4 SSH in and patch
 
 ```bash
-ssh -i ~/.ssh/oracle_key opc@<PUBLIC_IP>
+ssh -i ~/.ssh/oracle_key opc@<NEW_VA_PUBLIC_IP>
 sudo dnf update -y     # Oracle Linux
 # OR: sudo apt update && sudo apt upgrade -y   # Ubuntu
 ```
 
-(Optional) Disable password auth and require the SSH key — usually already the case on Oracle images.
+(Optional) Confirm the architecture is aarch64 and that you can't see the other project:
+
+```bash
+uname -m               # → aarch64
+ip addr                # → 10.1.x.x — different range from the other VCN
+```
+
+If `ip addr` shows the old VCN's range, you're on the wrong instance.
 
 ---
 
