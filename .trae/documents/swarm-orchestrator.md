@@ -43,6 +43,94 @@ The user **only ever talks to the CoS**. Specialists can also **talk to each oth
 
 ---
 
+## 0.1 Status snapshot — what's working, what's planned, what's not
+
+The fastest way to see where the project is. Read this first.
+
+| # | Area | Feature | Status | Where it lives |
+|---|---|---|---|---|
+| **V1 — the original MVP (shipped, working)** | | | | |
+| 1 | Chat UI | Next.js 14 App Router, TypeScript, Tailwind, shadcn/ui | ✅ Working | [next-app/](file:///workspace/superhuman-va/next-app/) |
+| 2 | Chat backend | Streaming chat via single DeepSeek call | ✅ Working | [next-app/app/api/chat/route.ts](file:///workspace/superhuman-va/next-app/app/api/chat/route.ts) |
+| 3 | Persistence | PocketBase v0.23: `conversations` + `messages` collections | ✅ Working | [next-app/lib/pocketbase.ts](file:///workspace/superhuman-va/next-app/lib/pocketbase.ts) |
+| 4 | Memory | Mem0 (mem0ai v1.0+) with native `deepseek` LLM adapter | ✅ Working | [memory-service/app/memory.py](file:///workspace/superhuman-va/memory-service/app/memory.py) |
+| 5 | Embeddings | FastEmbed `BAAI/bge-small-en-v1.5` (384-dim, local CPU) | ✅ Working | [memory-service/app/memory.py](file:///workspace/superhuman-va/memory-service/app/memory.py) |
+| 6 | Vector store | Qdrant v1.12.0 (collections: `memories`, `documents`) | ✅ Working | [memory-service/app/qdrant_client.py](file:///workspace/superhuman-va/memory-service/app/qdrant_client.py) |
+| 7 | Document RAG | PDF parsing, chunking, embedding, search | ✅ Working | [memory-service/app/routes/documents.py](file:///workspace/superhuman-va/memory-service/app/routes/documents.py) |
+| 8 | Memory service | FastAPI, /memory + /documents endpoints, health check | ✅ Working | [memory-service/](file:///workspace/superhuman-va/memory-service/) |
+| 9 | File upload | Browser uploads to memory service | ✅ Working | [next-app/app/api/upload/route.ts](file:///workspace/superhuman-va/next-app/app/api/upload/route.ts) |
+| 10 | Memory panel UI | List/clear memories | ✅ Working | [next-app/components/memory-panel.tsx](file:///workspace/superhuman-va/next-app/components/memory-panel.tsx) |
+| 11 | Document uploader UI | Drag-and-drop file upload | ✅ Working | [next-app/components/document-uploader.tsx](file:///workspace/superhuman-va/next-app/components/document-uploader.tsx) |
+| 12 | Conversation sidebar | List, create, switch conversations | ✅ Working | [next-app/components/sidebar.tsx](file:///workspace/superhuman-va/next-app/components/sidebar.tsx) |
+| 13 | Reverse proxy | Caddy 2.8 with self-signed TLS | ✅ Working | [caddy/Caddyfile](file:///workspace/superhuman-va/caddy/Caddyfile) |
+| 14 | Docker stack | 5 services: pocketbase, qdrant, memory-service, next-app, caddy | ✅ Working | [docker-compose.yml](file:///workspace/superhuman-va/docker-compose.yml) |
+| 15 | Cloud deploy | Oracle Cloud Free Tier ARM A1, new VCN, full isolation | ✅ Designed | [.trae/documents/cloud-deploy-oracle.md](file:///workspace/.trae/documents/cloud-deploy-oracle.md) |
+| 16 | Next.js standalone build | Multi-stage Dockerfile for production | ✅ Working | [next-app/Dockerfile](file:///workspace/superhuman-va/next-app/Dockerfile) |
+| **V2 — the swarm (planned in this doc, none built yet)** | | | | |
+| 17 | Subagent framework | OpenAI Agents SDK + custom model adapter | 📋 Planned | §2 |
+| 18 | DeepSeek V4 Pro | `deepseek-v4-pro` for all agents, with `thinking` mode per agent | 📋 Planned (1-line config change + adapter) | §2.2 |
+| 19 | Chief of Staff agent | The user-facing hub; always-on; TLDRs + visualizes + recommends | 📋 Planned | §1.1, §3.3 |
+| 20 | Cross-conversation memory | Mem0 user-scope (already) + new `memories_global` collection + `promote_to_global` tool | 📋 Planned | §1.4.1 |
+| 21 | Persistent agent state | New PB `agent_state` collection, per-(conv, agent), loaded each turn | 📋 Planned | §1.4.2 |
+| 22 | Agent-to-agent messaging | New PB `agent_messages` collection + `consult_agent` tool | 📋 Planned | §1.4.3 |
+| 23 | Code execution | `compute` + `run_code` via `node:vm` sandbox | 📋 Planned | §1.4.5 |
+| 24 | Conflict resolution | 3 strategies: CoS rules / user picks / Critic arbitrates (Think Max) | 📋 Planned | §1.4.6 |
+| 25 | Chat route rewrite | CoS-driven streaming + V2 context load | 📋 Planned | §4 |
+| 26 | Team Panel UI | Right-drawer with live A2A + conflict events | 📋 Planned | §5 |
+| 27 | ConflictCard UI | Picker for `values_tradeoff` conflicts | 📋 Planned | §1.4.6 |
+| 28 | Specialist agents (12+) | CTO, CFO, CMO, CSO, ADHD Coach, Fitness, Therapist, Memory, Document, Researcher, Planner, Critic | 📋 Planned | §3.2 |
+| 29 | Critic arbitration mode | Think Max + prompt suffix for decisive verdicts | 📋 Planned | §1.4.6 |
+| 30 | Tavily web search | Researcher agent uses Tavily free tier | 📋 Planned | §2.3 |
+| 31 | DeepSeek V4 Pro migration | All LLM calls: `deepseek-chat` → `deepseek-v4-pro` | 📋 Planned (1 line change in 2 files) | §6 |
+| **Tier 1 — blocks the app in production (not started)** | | | | |
+| 32 | Error handling + retry | try/catch around `Runner.runStreamed`; backoff on transient errors | ❌ Not started | §12.1 T1.1 |
+| 33 | Per-conversation rate limiting | Cap 60 turns/conv, 200 turns/hour | ❌ Not started | §12.1 T1.2 |
+| 34 | Tracing / observability | SDK built-in trace → SQLite-backed log | ❌ Not started | §12.1 T1.3 |
+| 35 | Golden-question eval harness | 10-20 questions, expected behavior, run after every prompt change | ❌ Not started | §12.1 T1.4 |
+| 36 | Sandbox-escape security tests | Test suite for `node:vm` breakouts (require, process, fetch, infinite loops) | ❌ Not started | §12.1 T1.5 |
+| 37 | Backup / restore | `scripts/backup.sh` for PB SQLite + Qdrant snapshots | ❌ Not started | §12.1 T1.6 |
+| 38 | PII purge / "forget me" | Mem0 `delete_all` + "Delete all my data" command | ❌ Not started | §12.1 T1.8 |
+| **Tier 2 — important, ship within a few weeks (not started)** | | | | |
+| 39 | Single-password auth | Even a shared password in front of the cloud deploy | ❌ Not started | §12.2 T2.1 |
+| 40 | Cost observability | Per-turn / per-agent token widget | ❌ Not started | §12.2 T2.2 |
+| 41 | Search across conversation history | `search_messages` on Qdrant | ❌ Not started | §12.2 T2.3 |
+| 42 | Conflict UI polish | Show context, allow re-pick, "ask again" | ❌ Not started | §12.2 T2.4 |
+| 43 | Unit + integration tests | Tools, state/messaging, consult depth, fast path | ❌ Not started | §12.2 T2.5 |
+| 44 | Resilient SSE | `Last-Event-Id` resume on disconnect | ❌ Not started | §12.2 T2.6 |
+| **Tier 3 — v2 follow-ups (deferred)** | | | | |
+| 45 | Real Python sandbox | Pyodide or Docker worker for pandas/numpy | ❌ Deferred | §12.3 T3.1 |
+| 46 | `isolated-vm` instead of `node:vm` | True per-call memory caps | ❌ Deferred | §12.3 T3.2 |
+| 47 | LangSmith / Phoenix tracing | Beautiful UIs for swarm traces | ❌ Deferred | §12.3 T3.3 |
+| 48 | Multi-device sync | Phone + laptop with shared state | ❌ Deferred | §12.3 T3.4 |
+| 49 | Voice input / TTS output | OpenAI Realtime API for the CoS | ❌ Deferred | §12.3 T3.5 |
+| 50 | Encrypted at rest | Qdrant + PocketBase AES-encryption | ❌ Deferred | §12.3 T3.6 |
+| 51 | Export / share CoS answer | Redacted public link | ❌ Deferred | §12.3 T3.7 |
+| 52 | Formal CI eval harness | 100+ golden questions, fails-the-build regression | ❌ Deferred | §12.3 T3.8 |
+| 53 | Per-agent cost budgets | Show per-agent spend | ❌ Deferred | §12.3 T3.9 |
+| 54 | Multi-agent voting | For `domain_internal` conflicts | ❌ Deferred | §12.3 T3.10 |
+| 55 | Audit log of CoS decisions | "Why?" button on each assistant message | ❌ Deferred | §12.3 T3.11 |
+
+**Counts**:
+
+| Tier | ✅ Built | 📋 Planned | ❌ Not started | Total |
+|---|---|---|---|---|
+| V1 (original MVP) | 16 | 0 | 0 | 16 |
+| V2 (swarm) | 0 | 15 | 0 | 15 |
+| Tier 1 (blocks production) | 0 | 0 | 7 | 7 |
+| Tier 2 (ship within weeks) | 0 | 0 | 6 | 6 |
+| Tier 3 (v2 follow-ups) | 0 | 0 | 11 | 11 |
+| **Total** | **16** | **15** | **24** | **55** |
+
+**Net status**: 16/55 = ~29% built (the V1 MVP is solid). 15/55 = ~27% designed in detail (the V2 swarm plan is decision-complete). 24/55 = ~44% open (the swarm hasn't been coded, and Tier 1/2 are open work).
+
+**Biggest gap right now**: items 17-31 (the swarm) — designed but not coded. Items 32-38 (Tier 1) — not even designed in detail, just identified as required. Everything else is correctly deferred.
+
+**If you want to ship a working demo this week**: implement V2 in this order — §0 Quickstart minutes 0-90 → §10 Ship order. After that, the swarm is functional; everything else is hardening.
+
+**If you want to ship to production this month**: V2 + Tier 1. After that, the app is production-safe; everything else is polish.
+
+---
+
 ## 0. Quickstart — first 90 minutes
 
 If you want to see the swarm end-to-end in one sitting, do this in order. After step 5 you'll have a working CoS + Memory + Document on your local docker stack. Everything after step 5 is incremental.
