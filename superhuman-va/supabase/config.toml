@@ -1,5 +1,5 @@
-# Supabase project name (used by `supabase` CLI)
-project_name = "superhuman-va"
+# Supabase CLI project name (used by `supabase` CLI; harmless in older versions)
+project_id = "superhuman-va"
 
 # A string used to distinguish different Supabase projects on the same host.
 # Defaults to the working directory name when running `supabase init`.
@@ -65,4 +65,3 @@ enabled = true
 # Configure one or more regions to use for edge functions.
 # https://supabase.com/docs/guides/functions#regions
 # Default to "us-east-1" (iad1) to match the Vercel region in vercel.json.
-regions = ["us-east-1"]

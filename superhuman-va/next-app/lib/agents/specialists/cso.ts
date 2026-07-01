@@ -36,5 +36,5 @@ export const csoAgent = new Agent({
   name: "CSO",
   instructions: PROMPT,
   model: MODEL,
-  tools: [consultAgent(importAgent), runCodeTool],
+  tools: [consultAgent(importAgent, "CSO"), runCodeTool],
 });

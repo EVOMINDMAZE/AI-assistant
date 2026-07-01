@@ -33,5 +33,5 @@ export const ctoAgent = new Agent({
   name: "CTO",
   instructions: PROMPT,
   model: MODEL,
-  tools: [consultAgent(importAgent), computeTool, runCodeTool],
+  tools: [consultAgent(importAgent, "CTO"), computeTool, runCodeTool],
 });

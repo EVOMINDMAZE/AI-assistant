@@ -29,7 +29,7 @@ import { importAgent } from "./registry";
 export const REASONING: ReasoningMode = "think_high";
 
 // Register agent names for the consult_agent tool's schema.
-setRegisteredAgentNames(AGENT_NAMES);
+setRegisteredAgentNames([...AGENT_NAMES]);
 
 const COS_PROMPT = `You are the user's Chief of Staff and their only point of contact.
 

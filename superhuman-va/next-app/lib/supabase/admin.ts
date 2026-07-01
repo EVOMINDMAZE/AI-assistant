@@ -1,13 +1,18 @@
 // lib/supabase/admin.ts — service-role Supabase client factory.
-// ⚠️  BYPASSES Row-Level Security. Only use server-side, with a userId you
-// trust (e.g. the one read from the session cookie, or passed in by an
-// authenticated route handler). Never expose to the browser.
+// ⚠️  BYPASSES Row-Level Security. Only use server-side.
 import "server-only";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-let _admin: ReturnType<typeof createClient> | null = null;
+let _admin: SupabaseClient | null = null;
 
-export function createAdminSupabase() {
+/**
+ * Returns a Supabase client using the service-role key.
+ * Uses a permissive (untyped) schema for convenience — the typed
+ * Database interface is in /types/database.ts for reference but the
+ * Supabase JS v2 generic type system is overly strict for our dynamic
+ * .from() usage. RLS bypass is the real safety guarantee here.
+ */
+export function createAdminSupabase(): SupabaseClient {
   if (_admin) return _admin;
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;

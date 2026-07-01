@@ -3,10 +3,10 @@
  */
 import { tool } from "@openai/agents";
 import { z } from "zod";
-import { tavily } from "@tavily/core";
+import { tavily as tavilyClient } from "tavily";
 
 const tvly = process.env.TAVILY_API_KEY
-  ? tavily({ apiKey: process.env.TAVILY_API_KEY })
+  ? tavilyClient({ apiKey: process.env.TAVILY_API_KEY })
   : null;
 
 export const webSearchTool = tool({

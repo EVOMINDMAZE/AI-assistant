@@ -1,10 +1,12 @@
 /**
  * Shared tool imports for specialists.
  *
- * Provides a per-specialist `consultAgent` tool that wraps the global
- * `getConsultTool` with this specialist's "from" name baked in.
+ * Provides a per-specialist `consultAgent` tool + the code-exec tools
+ * (`computeTool`, `runCodeTool`) for any specialist that needs math
+ * or a sandboxed JS snippet.
  */
 import "server-only";
+import vm from "node:vm";
 import { tool } from "@openai/agents";
 import { z } from "zod";
 import { Runner } from "@openai/agents";
@@ -12,6 +14,7 @@ import { deepseekModel, type ReasoningMode } from "@/lib/agents/model";
 import { postMessage, markReplied, markErrored } from "@/lib/messaging";
 import { AGENT_NAMES } from "@/lib/agent-types";
 
+// ─── consult_agent ─────────────────────────────────────────────────────────
 const DEPTH_LIMIT = 3;
 const BUDGET_PER_TURN = 4;
 
@@ -64,3 +67,97 @@ export function consultAgent(importAgent: (name: string) => Promise<any>, fromNa
     },
   });
 }
+
+// ─── compute / run_code (sandboxed JS) ─────────────────────────────────────
+const SAFE_GLOBALS: Record<string, unknown> = {
+  Math,
+  Date,
+  JSON,
+  Number,
+  String,
+  Boolean,
+  Array,
+  Object,
+  Map,
+  Set,
+  RegExp,
+  Error,
+  Symbol,
+  parseInt,
+  parseFloat,
+  isNaN,
+  isFinite,
+  encodeURIComponent,
+  decodeURIComponent,
+};
+
+interface RunResult {
+  stdout: string;
+  value: unknown;
+  error: string | null;
+}
+
+function runInSandbox(snippet: string, timeoutMs = 5000): RunResult {
+  const stdout: string[] = [];
+  const sandbox = {
+    ...SAFE_GLOBALS,
+    console: { log: (...args: any[]) => stdout.push(args.map(stringify).join(" ")) },
+    setTimeout,
+    clearTimeout,
+  };
+  const context = vm.createContext(sandbox);
+  let script: vm.Script;
+  try {
+    const wrapped = `(function() { "use strict";\n${snippet}\n})()`;
+    script = new vm.Script(wrapped, { filename: "snippet.js" });
+  } catch (err: any) {
+    return { stdout: "", value: undefined, error: `compile error: ${err.message}` };
+  }
+  try {
+    const value = script.runInContext(context, { timeout: timeoutMs });
+    return { stdout: stdout.join("\n"), value, error: null };
+  } catch (err: any) {
+    if (err?.code === "ERR_SCRIPT_EXECUTION_TIMEOUT") {
+      return { stdout: stdout.join("\n"), value: undefined, error: "Script execution timed out" };
+    }
+    return { stdout: stdout.join("\n"), value: undefined, error: err?.message ?? String(err) };
+  }
+}
+
+function stringify(x: unknown): string {
+  if (typeof x === "string") return x;
+  try {
+    return JSON.stringify(x);
+  } catch {
+    return String(x);
+  }
+}
+
+export const computeTool = tool({
+  name: "compute",
+  description:
+    "Evaluate a single math expression. Returns a number. Use for any numeric claim " +
+    "(ROI, NPV, time, percentages). Example: `compute('Math.pow(1.07, 30) * 10000')` → 76122.55.",
+  parameters: z.object({
+    expression: z.string().describe("A JavaScript math expression."),
+  }),
+  async execute({ expression }) {
+    const res = runInSandbox(`return (${expression});`, 2000);
+    if (res.error) return { error: res.error };
+    return { value: res.value };
+  },
+});
+
+export const runCodeTool = tool({
+  name: "run_code",
+  description:
+    "Run a multi-line JavaScript snippet in a sandboxed VM. Returns `{stdout, value, error}`. " +
+    "5-second timeout. No `require`, no `process`, no `fetch`, no `fs` — the sandbox blocks them. " +
+    "Use for prototypes, simulations, payload demos. NOT a general-purpose executor.",
+  parameters: z.object({
+    snippet: z.string().describe("JavaScript source. Last expression's value is returned."),
+  }),
+  async execute({ snippet }) {
+    return runInSandbox(snippet, 5000);
+  },
+});

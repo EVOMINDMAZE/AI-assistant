@@ -1,13 +1,5 @@
 /**
  * Agent-to-agent messaging bus, backed by Supabase `agent_messages`.
- *
- * Every `consult_agent(name, msg)` call:
- *   1. Inserts a row with status=pending
- *   2. Invokes the target agent via the OpenAI Agents SDK
- *   3. Updates the row with status=replied, reply=<text>
- *   4. Returns the reply text to the caller
- *
- * The Team Panel reads from this table to render the A2A timeline.
  */
 import "server-only";
 import { createAdminSupabase } from "@/lib/supabase/admin";
@@ -61,13 +53,13 @@ export async function markErrored(
   error: string
 ): Promise<AgentMessage> {
   const sb = createAdminSupabase();
-  const { data, err } = await sb
+  const { data, error: dbError } = await sb
     .from("agent_messages")
     .update({ reply: error, status: "errored" })
     .eq("id", messageId)
     .select("*")
     .single();
-  if (err) throw new Error(`markErrored failed: ${err.message}`);
+  if (dbError) throw new Error(`markErrored failed: ${dbError.message}`);
   return data as unknown as AgentMessage;
 }
 

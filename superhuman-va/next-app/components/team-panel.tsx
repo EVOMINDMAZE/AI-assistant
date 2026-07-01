@@ -177,7 +177,7 @@ function Row({
                   {event.tool}
                 </span>
               </div>
-              {event.args && (
+              {Boolean(event.args) && (
                 <pre className="mt-1 max-h-20 overflow-auto rounded bg-background/50 p-1.5 text-[10px] text-muted-foreground">
                   {JSON.stringify(event.args, null, 2)}
                 </pre>

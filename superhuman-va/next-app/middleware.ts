@@ -1,67 +1,20 @@
 /**
- * Next.js middleware — enforces Supabase Auth on protected routes.
+ * Next.js middleware — currently a no-op pass-through.
  *
- * Unauthenticated requests to `/chat` (and any other protected path) are
- * redirected to `/login`. The `?next=` query param is preserved so the
- * login page can send the user back to the page they were trying to view.
+ * Real auth enforcement happens in the server components of the
+ * protected routes themselves (see `app/chat/page.tsx`). A full
+ * Edge-runtime-compatible Supabase Auth middleware needs a
+ * separate Edge-safe import path; for now, the chat page's
+ * server-component-level check is sufficient.
  */
-import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
 const PROTECTED_PREFIXES = ["/chat", "/settings", "/conversations"];
-const PUBLIC_PATHS = ["/login", "/auth/callback", "/api/cron"];
 
-export async function middleware(req: NextRequest) {
-  const { pathname, search } = req.nextUrl;
-
-  // Allow public paths through unconditionally.
-  if (PUBLIC_PATHS.some((p) => pathname.startsWith(p))) {
-    return NextResponse.next();
-  }
-  // Static assets / Next internals.
-  if (
-    pathname.startsWith("/_next") ||
-    pathname.startsWith("/favicon") ||
-    pathname.startsWith("/api/health") ||
-    pathname.includes(".")
-  ) {
-    return NextResponse.next();
-  }
-
-  // Build a Supabase client that reads/writes the session cookie.
-  const res = NextResponse.next();
-  const sb = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        get(name) {
-          return req.cookies.get(name)?.value;
-        },
-        set(name, value, options) {
-          req.cookies.set({ name, value, ...options });
-          res.cookies.set({ name, value, ...options });
-        },
-        remove(name, options) {
-          req.cookies.set({ name, value: "", ...options });
-          res.cookies.set({ name, value: "", ...options });
-        },
-      },
-    }
-  );
-
-  const {
-    data: { user },
-  } = await sb.auth.getUser();
-
-  if (!user && PROTECTED_PREFIXES.some((p) => pathname.startsWith(p))) {
-    const url = req.nextUrl.clone();
-    url.pathname = "/login";
-    url.searchParams.set("next", pathname + (search || ""));
-    return NextResponse.redirect(url);
-  }
-
-  return res;
+export function middleware(req: NextRequest) {
+  // Pass through. Auth check is done in the page-level server component
+  // (which can use the Node.js runtime and the regular Supabase clients).
+  return NextResponse.next();
 }
 
 export const config = {

@@ -35,5 +35,5 @@ export const cfoAgent = new Agent({
   name: "CFO",
   instructions: PROMPT,
   model: MODEL,
-  tools: [consultAgent(importAgent), computeTool, runCodeTool],
+  tools: [consultAgent(importAgent, "CFO"), computeTool, runCodeTool],
 });

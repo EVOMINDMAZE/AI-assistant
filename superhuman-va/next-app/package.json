@@ -35,7 +35,7 @@
     "sonner": "^1.7.0",
     "tailwind-merge": "^2.5.4",
     "tailwindcss-animate": "^1.0.7",
-    "tavily": "^0.5.0",
+    "tavily": "^2.0.0",
     "ulid": "^2.3.0",
     "zod": "^3.23.8"
   },

@@ -34,5 +34,5 @@ export const cmoAgent = new Agent({
   name: "CMO",
   instructions: PROMPT,
   model: MODEL,
-  tools: [consultAgent(importAgent)],
+  tools: [consultAgent(importAgent, "CMO")],
 });

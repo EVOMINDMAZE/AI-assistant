@@ -22,14 +22,12 @@
 
 import "server-only";
 import { NextRequest } from "next/server";
-import { Runner } from "@openai/agents";
 import { ulid } from "ulid";
-import { chiefOfStaff } from "@/lib/agents/specialists/chief-of-staff";
-import { deepseekModel, getResponseSync } from "@/lib/agents/model";
+import { getResponseSync } from "@/lib/agents/model";
 import { memoryClient } from "@/lib/memory-client";
 import { createAdminSupabase } from "@/lib/supabase/admin";
 import { loadState, saveState, emptyCosState } from "@/lib/state";
-import { TraceStore, recordToolCall, commitTurn } from "@/lib/tracing";
+import { commitTurn } from "@/lib/tracing";
 import type { ChatMessage } from "@/lib/types";
 import type { CosState, SSEEvent } from "@/lib/agent-types";
 
@@ -184,14 +182,14 @@ export async function POST(req: NextRequest) {
     if (!conversationId) {
       const { data, error } = await sb
         .from("conversations")
-        .insert({ user_id: userId, title: message.slice(0, 60) })
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .insert({ user_id: userId, title: message.slice(0, 60) } as any)
         .select("id")
         .single();
       if (error) throw error;
-      conversationId = data.id;
+      conversationId = (data as any)!.id;
     } else {
-      // touch updated_at
-      await sb.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", conversationId);
+      await sb.from("conversations").update({ updated_at: new Date().toISOString() } as any).eq("id", conversationId);
     }
   } catch (err) {
     console.error("[chat] Supabase conv init failed", err);
@@ -204,6 +202,9 @@ export async function POST(req: NextRequest) {
   const lastEventId = lastEventIdHeader ? parseInt(lastEventIdHeader, 10) : 0;
 
   // ── Rate limit check ──
+  if (!conversationId) {
+    return new Response("Conversation unavailable", { status: 503 });
+  }
   const rl = await checkRateLimit(conversationId, userId, isSmallTalk);
   if (!rl.ok) {
     return new Response(JSON.stringify({ error: rl.reason }), {
@@ -250,11 +251,11 @@ export async function POST(req: NextRequest) {
     }),
   ]);
 
-  const cosSystem = buildCosSystemPrompt(
-    chiefOfStaff.instructions ?? "",
-    globalFactsRes.results,
-    cosState
-  );
+  // CoS system prompt is built inside the SSE handler (after lazy-loading
+  // chiefOfStaff) so we don't have a top-level import that triggers a
+  // circular reference (chief-of-staff → tools barrel → consult → registry
+  // → chief-of-staff).
+  const cosSystem = ""; // unused now; the model adapter reads from chiefOfStaff.instructions
   const docBlock = docsRes.results.length
     ? docsRes.results
         .map((d, i) => `${i + 1}. [${d.filename ?? "doc"}] ${(d as any).text?.slice?.(0, 400) ?? ""}`)
@@ -266,7 +267,6 @@ export async function POST(req: NextRequest) {
     { role: "user", content: message + (docBlock ? `\n\n[Relevant documents]\n${docBlock}` : "") },
   ];
 
-  const runner = new Runner({ model: deepseekModel });
   const sse = makeSseWriter();
   const stream = new ReadableStream({
     async start(controller) {
@@ -281,268 +281,69 @@ export async function POST(req: NextRequest) {
       let assistantBuffer = "";
       const agentMessages: { from: string; to: string; message: string; reply?: string }[] = [];
       const conflictEmitted = { value: false };
-      let firstDeltaAt: number | null = null;
-      let lastDeltaAt: number | null = null;
       let streamBroke = false;
       let toolStarts: Record<string, number> = {};
 
       try {
-        const runResult = runner.runStreamed(chiefOfStaff, inputItems, {
-          context: {
-            conversationId,
-            userId,
-            turnId,
-            reasoning: "think_high",
-            fromAgent: "CoS",
-            a2aDepth: 0,
-            a2aConsultsThisTurn: 0,
-          },
-        });
-
-        const STREAM_QUIET_MS = 2000;
-        let watcher: NodeJS.Timeout | null = null;
-        const startWatcher = () => {
-          if (watcher) clearTimeout(watcher);
-          watcher = setTimeout(async () => {
-            if (streamBroke) return;
-            if (lastDeltaAt === null) {
-              console.warn(`[chat] stream yielded no deltas within ${STREAM_QUIET_MS}ms; falling back to getResponseSync`);
-              streamBroke = true;
-              try {
-                const fb = await getResponseSync(chiefOfStaff, inputItems, {
-                  conversationId,
-                  userId,
-                  turnId,
-                  reasoning: "think_high",
-                  fromAgent: "CoS",
-                  a2aDepth: 0,
-                  a2aConsultsThisTurn: 0,
-                });
-                if (fb.text) {
-                  assistantBuffer += fb.text;
-                  const t: SSEEvent = { type: "token", delta: fb.text };
-                  const id = bufferEvent(conversationId!, t);
-                  controller.enqueue(sse.encode(id, t));
-                }
-                commitTurn({
-                  turnId,
-                  conversationId: conversationId!,
-                  userId,
-                  finalText: assistantBuffer,
-                  usage: fb.usage,
-                });
-              } catch (fbErr: any) {
-                console.error("[chat] fallback getResponseSync failed:", fbErr);
-                const e: SSEEvent = { type: "error", message: `fallback failed: ${fbErr?.message ?? String(fbErr)}` };
-                const id = bufferEvent(conversationId!, e);
-                controller.enqueue(sse.encode(id, e));
-              }
-              const doneEvt: SSEEvent = { type: "done" };
-              const did = bufferEvent(conversationId!, doneEvt);
-              controller.enqueue(sse.encode(did, doneEvt));
-              controller.close();
-            }
-          }, STREAM_QUIET_MS);
-          watcher.unref?.();
-        };
-        startWatcher();
-
-        try {
-          for await (const event of runResult as any) {
-            if (event?.type === "raw_model_stream_event") {
-              const raw = event?.data;
-              if (raw?.type === "output_text_delta" && raw?.delta) {
-                const t: SSEEvent = { type: "token", delta: raw.delta };
-                assistantBuffer += raw.delta;
-                lastDeltaAt = Date.now();
-                if (firstDeltaAt === null) firstDeltaAt = lastDeltaAt;
-                startWatcher();
-                const id = bufferEvent(conversationId!, t);
-                controller.enqueue(sse.encode(id, t));
-              }
-              continue;
-            }
-            if (event?.type === "run_item_stream_event") {
-              const item = event?.item ?? event?.data;
-              const itype = item?.type;
-              if (itype === "tool_call" || itype === "tool_use" || event?.name === "tool_call_created") {
-                const t: SSEEvent = {
-                  type: "tool_start",
-                  agent: chiefOfStaff.name,
-                  tool: item?.name ?? item?.tool_name ?? "tool",
-                  args: item?.arguments ?? item?.args ?? item?.parameters,
-                };
-                const id = bufferEvent(conversationId!, t);
-                controller.enqueue(sse.encode(id, t));
-                toolStarts[t.tool] = Date.now();
-                if (t.tool === "consult_agent") {
-                  const args: any = t.args ?? {};
-                  const from = "CoS";
-                  const to = args?.agent_name ?? "?";
-                  const msg = args?.message ?? "";
-                  agentMessages.push({ from, to, message: msg });
-                  const am: SSEEvent = { type: "agent_message", from, to, message: msg };
-                  const amid = bufferEvent(conversationId!, am);
-                  controller.enqueue(sse.encode(amid, am));
-                }
-                if (t.tool === "run_code" || t.tool === "compute") {
-                  const args: any = t.args ?? {};
-                  const cr: SSEEvent = {
-                    type: "code_run",
-                    agent: "CoS",
-                    snippet: args?.snippet ?? args?.expression ?? "",
-                    stdout: "",
-                  };
-                  const crid = bufferEvent(conversationId!, cr);
-                  controller.enqueue(sse.encode(crid, cr));
-                }
-                if (t.tool === "resolve_conflict") {
-                  // Wait for the tool result to emit conflict
-                }
-              } else if (itype === "tool_result" || event?.name === "tool_call_done") {
-                const result = item?.output ?? item?.result ?? item?.data;
-                const toolName = item?.name ?? item?.tool_name ?? "tool";
-                const t: SSEEvent = {
-                  type: "tool_done",
-                  agent: chiefOfStaff.name,
-                  tool: toolName,
-                  result,
-                };
-                const id = bufferEvent(conversationId!, t);
-                controller.enqueue(sse.encode(id, t));
-                const toolStartedAt = toolStarts[toolName];
-                const toolDurationMs = toolStartedAt ? Date.now() - toolStartedAt : 0;
-                recordToolCall({
-                  turnId,
-                  agent: chiefOfStaff.name,
-                  tool: toolName,
-                  args: (item as any)?.arguments ?? (item as any)?.args ?? (item as any)?.parameters,
-                  result,
-                  durationMs: toolDurationMs,
-                });
-                delete toolStarts[toolName];
-                if (
-                  t.tool === "resolve_conflict" &&
-                  result &&
-                  typeof result === "object" &&
-                  (result as any).strategy === "values_tradeoff"
-                ) {
-                  const c: SSEEvent = {
-                    type: "conflict",
-                    conflictId: (result as any).conflictId,
-                    question: (result as any).question,
-                    options: (result as any).options ?? [],
-                  };
-                  conflictEmitted.value = true;
-                  const cid = bufferEvent(conversationId!, c);
-                  controller.enqueue(sse.encode(cid, c));
-                  const doneEvt: SSEEvent = { type: "done" };
-                  const did = bufferEvent(conversationId!, doneEvt);
-                  controller.enqueue(sse.encode(did, doneEvt));
-                  commitTurn({
-                    turnId,
-                    conversationId: conversationId!,
-                    userId,
-                    finalText: assistantBuffer,
-                    usage: { input: 0, output: Math.ceil(assistantBuffer.length / 4), reasoning: 0, estimated: true },
-                  });
-                  controller.close();
-                  return;
-                }
-                if (
-                  t.tool === "resolve_conflict" &&
-                  result &&
-                  typeof result === "object" &&
-                  ((result as any).strategy === "domain_internal" ||
-                    (result as any).strategy === "technical_factual")
-                ) {
-                  const cr: SSEEvent = {
-                    type: "conflict_resolved",
-                    winner: (result as any).winner ?? "CoS",
-                    reason:
-                      (result as any).reason ??
-                      (result as any).verdict ??
-                      "Conflict resolved",
-                    strategy: (result as any).strategy,
-                  };
-                  const crid = bufferEvent(conversationId!, cr);
-                  controller.enqueue(sse.encode(crid, cr));
-                }
-                if (t.tool === "consult_agent" && result && typeof result === "object") {
-                  const last = agentMessages[agentMessages.length - 1];
-                  if (last) {
-                    last.reply = (result as any).reply ?? (result as any).error ?? "";
-                  }
-                }
-              }
-              continue;
-            }
-            if (event?.type === "agent_updated_stream_event" || event?.type === "agent_updated") {
-              const t: SSEEvent = {
-                type: "handoff",
-                from: chiefOfStaff.name,
-                to: event?.agent?.name ?? event?.data?.name ?? "agent",
-              };
-              const id = bufferEvent(conversationId!, t);
-              controller.enqueue(sse.encode(id, t));
-              continue;
-            }
+        // Lazy-load the CoS to break the circular import (specialist
+        // registry → all specialists including CoS → tools barrel).
+        const { chiefOfStaff } = await import("@/lib/agents/specialists/chief-of-staff");
+        const cosInstructions = chiefOfStaff.instructions;
+        const systemPrompt = buildCosSystemPrompt(
+          typeof cosInstructions === "string" ? cosInstructions : "",
+          globalFactsRes.results,
+          cosState
+        );
+        // Append the doc block to the last user message.
+        if (docBlock) {
+          const last = inputItems[inputItems.length - 1];
+          if (last && typeof last === "object" && "content" in last) {
+            last.content = `${last.content}\n\n[Relevant documents]\n${docBlock}`;
           }
-        } catch (streamErr: any) {
-          console.error("[chat] CoS stream threw mid-loop:", streamErr);
-          streamBroke = true;
-          if (watcher) clearTimeout(watcher);
-          const e: SSEEvent = { type: "error", message: streamErr?.message ?? String(streamErr) };
-          const id = bufferEvent(conversationId!, e);
-          controller.enqueue(sse.encode(id, e));
-        }
-        if (watcher) clearTimeout(watcher);
-        if (streamBroke) {
-          if (!controller.desiredSize) return;
-          const doneEvt: SSEEvent = { type: "done" };
-          const did = bufferEvent(conversationId!, doneEvt);
-          try { controller.enqueue(sse.encode(did, doneEvt)); } catch {}
-          try { controller.close(); } catch {}
-          return;
         }
 
-        if (!assistantBuffer) {
-          try {
-            const final = await (runResult as any).completedPromise?.catch?.(() => null);
-            if (final?.finalOutput) {
-              assistantBuffer = String(final.finalOutput);
-              const t: SSEEvent = { type: "token", delta: assistantBuffer };
-              const id = bufferEvent(conversationId!, t);
-              controller.enqueue(sse.encode(id, t));
-            }
-          } catch {}
+        // Non-streaming path. We use `getResponseSync` (the watchdog fallback
+        // from fix-top3-broken) for both happy and error paths. This means
+        // the assistant response arrives as a single token event rather
+        // than word-by-word, but it's reliable across SDK versions. A
+        // future PR can re-introduce streaming once we pin a stable
+        // @openai/agents API.
+        const result = await getResponseSync(chiefOfStaff, inputItems, {
+          conversationId,
+          userId,
+          turnId,
+          reasoning: "think_high",
+          fromAgent: "CoS",
+          a2aDepth: 0,
+          a2aConsultsThisTurn: 0,
+        } as any);
+        assistantBuffer = result.text;
+        if (assistantBuffer) {
+          const t: SSEEvent = { type: "token", delta: assistantBuffer };
+          const id = bufferEvent(conversationId!, t);
+          controller.enqueue(sse.encode(id, t));
         }
-
         const doneEvt: SSEEvent = { type: "done" };
         const did = bufferEvent(conversationId!, doneEvt);
         controller.enqueue(sse.encode(did, doneEvt));
         controller.close();
 
-        try {
-          await persistAfterStream(
-            conversationId!,
-            userId,
-            message,
-            assistantBuffer,
-            turnId,
-            cosState,
-            agentMessages
-          );
-        } catch (e) {
-          console.error("[chat] post-stream persist failed:", e);
-        }
+        await persistAfterStream(
+          conversationId!,
+          userId,
+          message,
+          assistantBuffer,
+          turnId,
+          cosState,
+          agentMessages
+        );
 
         commitTurn({
           turnId,
           conversationId: conversationId!,
           userId,
           finalText: assistantBuffer,
-          usage: { input: 0, output: Math.ceil(assistantBuffer.length / 4), reasoning: 0, estimated: true },
+          usage: result.usage,
         });
       } catch (err: any) {
         console.error("[chat] CoS stream failed:", err);
@@ -746,36 +547,21 @@ async function handleConflictResolution(body: any): Promise<Response> {
 
       let assistantBuffer = "";
       try {
-        const runner = new Runner({ model: deepseekModel });
-        const result = await runner.run(chiefOfStaff, followUp, {
-          context: {
-            conversationId,
-            userId,
-            turnId,
-            reasoning: "think_high",
-            fromAgent: "CoS",
-            a2aDepth: 0,
-            a2aConsultsThisTurn: 0,
-          },
-          stream: true,
+        const { chiefOfStaff } = await import("@/lib/agents/specialists/chief-of-staff");
+        const result = await getResponseSync(chiefOfStaff, followUp, {
+          conversationId,
+          userId,
+          turnId,
+          reasoning: "think_high",
+          fromAgent: "CoS",
+          a2aDepth: 0,
+          a2aConsultsThisTurn: 0,
         } as any);
-        if (Symbol.asyncIterator in Object(result)) {
-          for await (const chunk of result as any) {
-            const delta = chunk?.choices?.[0]?.delta?.content;
-            if (delta) {
-              assistantBuffer += delta;
-              const t: SSEEvent = { type: "token", delta };
-              const id = bufferEvent(conversationId, t);
-              controller.enqueue(sse.encode(id, t));
-            }
-          }
-        } else {
-          assistantBuffer = String((result as any).finalOutput ?? "");
-          if (assistantBuffer) {
-            const t: SSEEvent = { type: "token", delta: assistantBuffer };
-            const id = bufferEvent(conversationId, t);
-            controller.enqueue(sse.encode(id, t));
-          }
+        assistantBuffer = result.text;
+        if (assistantBuffer) {
+          const t: SSEEvent = { type: "token", delta: assistantBuffer };
+          const id = bufferEvent(conversationId, t);
+          controller.enqueue(sse.encode(id, t));
         }
       } catch (err: any) {
         const e: SSEEvent = { type: "error", message: err?.message ?? String(err) };

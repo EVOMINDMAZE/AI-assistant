@@ -17,7 +17,7 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-type AdminClient = SupabaseClient<any, "public", any>;
+type AdminClient = SupabaseClient;
 
 export type MemoryHit = {
   id: string;

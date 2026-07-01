@@ -204,8 +204,9 @@ export function estimateUsage(
 }
 
 /** The Model adapter for the OpenAI Agents SDK. */
-export const deepseekModel: Model = {
-  async getResponse(systemPrompt, input, _modelSettings, _tools, _context) {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const deepseekModel: any = {
+  async getResponse(systemPrompt: any, input: any, _modelSettings: any, _tools: any, _context: any) {
     const ctx = (_context as RunContextLike) ?? {};
     const reasoning: ReasoningMode = ctx.reasoning ?? "think_high";
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
@@ -235,7 +236,7 @@ export const deepseekModel: Model = {
     } as any;
   },
 
-  async *streamResponse(systemPrompt, input, _modelSettings, _tools, _context) {
+  async *streamResponse(systemPrompt: any, input: any, _modelSettings: any, _tools: any, _context: any) {
     const ctx = (_context as RunContextLike) ?? {};
     const reasoning: ReasoningMode = ctx.reasoning ?? "think_high";
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
