@@ -17,7 +17,6 @@ interface Props {
   activeId: string | null;
   onSelect: (id: string) => void;
   onCreate: () => void;
-  userId: string;
 }
 
 interface SearchHit {
@@ -29,13 +28,32 @@ interface SearchHit {
   score: number;
 }
 
-export function Sidebar({ activeId, onSelect, onCreate, userId }: Props) {
+export function Sidebar({ activeId, onSelect, onCreate }: Props) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchHit[]>([]);
   const [searching, setSearching] = useState(false);
+  const [userId, setUserId] = useState<string | null>(null);
   const debounceRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Resolve the signed-in user from the Supabase session.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { createBrowserSupabase } = await import("@/lib/supabase/client");
+        const sb = createBrowserSupabase();
+        const { data } = await sb.auth.getUser();
+        if (!cancelled && data?.user) setUserId(data.user.id);
+      } catch {
+        // Sidebar degrades silently if auth lookup fails.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function refresh() {
     setBusy(true);
@@ -53,7 +71,7 @@ export function Sidebar({ activeId, onSelect, onCreate, userId }: Props) {
 
   const runSearch = useCallback(
     async (q: string) => {
-      if (!q.trim()) {
+      if (!q.trim() || !userId) {
         setSearchResults([]);
         return;
       }

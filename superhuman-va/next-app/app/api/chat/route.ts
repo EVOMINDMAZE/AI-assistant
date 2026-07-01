@@ -26,6 +26,7 @@ import { ulid } from "ulid";
 import { getResponseSync } from "@/lib/agents/model";
 import { memoryClient } from "@/lib/memory-client";
 import { createAdminSupabase } from "@/lib/supabase/admin";
+import { createServerSupabase } from "@/lib/supabase/server";
 import { loadState, saveState, emptyCosState } from "@/lib/state";
 import { commitTurn } from "@/lib/tracing";
 import type { ChatMessage } from "@/lib/types";
@@ -34,6 +35,25 @@ import type { CosState, SSEEvent } from "@/lib/agent-types";
 export const runtime = "nodejs";
 export const maxDuration = 60; // Vercel Pro
 export const dynamic = "force-dynamic";
+
+// ─── Auth helper ──────────────────────────────────────────────────────────
+// Resolves the signed-in user from the Supabase session cookie. Returns
+// either { user } or { error }. We never trust userId from the request
+// body — only the server-side session is authoritative.
+async function getAuthedUser(): Promise<
+  { user: { id: string } } | { error: string }
+> {
+  try {
+    const sb = createServerSupabase();
+    const { data, error } = await sb.auth.getUser();
+    if (error || !data?.user) {
+      return { error: "not signed in" };
+    }
+    return { user: { id: data.user.id } };
+  } catch (err) {
+    return { error: `auth check failed: ${(err as Error).message}` };
+  }
+}
 
 const SMALL_TALK = /^(hi|hey|hello|yo|thanks|thank you|ok|okay|lol|bye|goodbye|good morning|good night|sup|hola)[\s!.]*$/i;
 
@@ -157,6 +177,16 @@ function smallTalkReply(msg: string): string {
 
 // ─── POST /api/chat ────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
+  // ── Auth: must have a valid Supabase session cookie ──
+  const auth = await getAuthedUser();
+  if ("error" in auth) {
+    return new Response(JSON.stringify({ error: "not signed in" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  const sessionUserId = auth.user.id;
+
   let body: any;
   try {
     body = await req.json();
@@ -165,14 +195,14 @@ export async function POST(req: NextRequest) {
   }
 
   if (body?.kind === "conflict_resolution") {
-    return handleConflictResolution(body);
+    return handleConflictResolution(body, sessionUserId);
   }
   if (body?.kind === "forget_everything") {
-    return handleForgetEverything(body);
+    return handleForgetEverything(body, sessionUserId);
   }
 
   const message: string = (body.message ?? "").trim();
-  const userId: string = body.userId || process.env.USER_ID || "local-user";
+  const userId: string = sessionUserId;
   if (!message) return new Response("Empty message", { status: 400 });
 
   // ── Conversation bootstrap ──
@@ -496,7 +526,7 @@ function sseResponse(stream: ReadableStream, conversationId: string): Response {
 }
 
 // ─── Conflict resolution resume branch ─────────────────────────────────────
-async function handleConflictResolution(body: any): Promise<Response> {
+async function handleConflictResolution(body: any, userId: string): Promise<Response> {
   const { conversationId, conflictId, choice } = body as {
     conversationId?: string;
     conflictId?: string;
@@ -506,7 +536,6 @@ async function handleConflictResolution(body: any): Promise<Response> {
     return new Response("missing fields", { status: 400 });
   }
 
-  const userId: string = body.userId || process.env.USER_ID || "local-user";
   const turnId = ulid();
   const sse = makeSseWriter();
 
@@ -590,8 +619,7 @@ async function handleConflictResolution(body: any): Promise<Response> {
 }
 
 // ─── forget_everything ─────────────────────────────────────────────────────
-async function handleForgetEverything(body: any): Promise<Response> {
-  const userId: string = body.userId || process.env.USER_ID || "local-user";
+async function handleForgetEverything(body: any, userId: string): Promise<Response> {
   const results: Record<string, string> = {};
   try {
     try {

@@ -20,8 +20,6 @@ import {
 import type { ChatMessage } from "@/lib/types";
 import type { SSEEvent } from "@/lib/agent-types";
 
-const USER_ID = "local-user"; // single-user MVP
-
 function newId() {
   return Math.random().toString(36).slice(2, 11);
 }
@@ -74,7 +72,6 @@ export default function ChatPage() {
               : {}),
           },
           body: JSON.stringify({
-            userId: USER_ID,
             conversationId: conversationId ?? undefined,
             message: text,
           }),
@@ -198,7 +195,6 @@ export default function ChatPage() {
             conversationId,
             conflictId,
             choice,
-            userId: USER_ID,
           }),
         });
         if (!res.ok || !res.body) {
@@ -261,7 +257,7 @@ export default function ChatPage() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kind: "forget_everything", userId: USER_ID }),
+        body: JSON.stringify({ kind: "forget_everything" }),
       });
       const data = await res.json();
       alert(data.message ?? "Purged.");
@@ -300,7 +296,6 @@ export default function ChatPage() {
         activeId={conversationId}
         onSelect={setConversationId}
         onCreate={newChat}
-        userId={USER_ID}
       />
 
       <main className="flex flex-1 flex-col">
