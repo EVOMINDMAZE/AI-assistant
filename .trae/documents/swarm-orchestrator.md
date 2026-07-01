@@ -43,6 +43,26 @@ The user **only ever talks to the CoS**. Specialists can also **talk to each oth
 
 ---
 
+## 0. Quickstart — first 90 minutes
+
+If you want to see the swarm end-to-end in one sitting, do this in order. After step 5 you'll have a working CoS + Memory + Document on your local docker stack. Everything after step 5 is incremental.
+
+| Min | Step | Command / file |
+|---|---|---|
+| 0-5 | Confirm DeepSeek V4 Pro is in your account. | `curl -sS https://api.deepseek.com/v1/models -H "Authorization: Bearer $DEEPSEEK_API_KEY" \| jq '.data[].id' \| grep v4-pro` |
+| 5-10 | Install the SDK and Tavily. | `cd next-app && npm i @openai/agents tavily` |
+| 10-25 | Write the model adapter. | Create [next-app/lib/agents/model.ts](file:///workspace/superhuman-va/next-app/lib/agents/model.ts) (sketch in §2.2). Run the hello-world script: `node -e "import('./lib/agents/model.js').then(m => m.runHelloWorld())"` — should print "Hello, world." streamed. |
+| 25-35 | Add the new PB collections. | Edit [memory-service/scripts/pb_bootstrap.py](file:///workspace/superhuman-va/memory-service/scripts/pb_bootstrap.py) to add `agent_state` and `agent_messages` (schemas in §16). `docker compose up -d pocketbase && python scripts/pb_bootstrap.py`. |
+| 35-45 | Add the Mem0 global pool. | Edit [memory-service/app/qdrant_client.py](file:///workspace/superhuman-va/memory-service/app/qdrant_client.py) (add `memories_global`), [memory-service/app/memory.py](file:///workspace/superhuman-va/memory-service/app/memory.py) (3 new methods), [memory-service/app/routes/memories.py](file:///workspace/superhuman-va/memory-service/app/routes/memories.py) (3 new endpoints). |
+| 45-55 | Build the state + messaging helpers. | Create [next-app/lib/state.ts](file:///workspace/superhuman-va/next-app/lib/state.ts) and [next-app/lib/messaging.ts](file:///workspace/superhuman-va/next-app/lib/messaging.ts). Wire to PB. |
+| 55-65 | Build the four core tools. | Create `tools/{mem0,qdrant,state,consult}.ts` (sketches in §2.3). All ~250 LOC combined. |
+| 65-80 | Define the CoS + Memory + Document agents. | Create the three specialist files. The CoS prompt is in §3.3. |
+| 80-90 | Rewrite [chat/route.ts](file:///workspace/superhuman-va/next-app/app/api/chat/route.ts) to use the CoS (sketch in §4.2). | Open the browser, send a message. Team panel shows the swarm in action. |
+
+At min 90 you have a working swarm. Everything after is the additional agents, code exec, and conflict resolution from the ship order.
+
+---
+
 ## 1. Architecture
 
 ### 1.1 The team
@@ -226,8 +246,11 @@ This section is the meat of V2. Each subsection maps to one of the four new requ
 **Design**:
 
 - **Single constant** `MODEL = "deepseek-v4-pro"` in [next-app/lib/agents/model.ts](file:///workspace/superhuman-va/next-app/lib/agents/model.ts).
-- **Reasoning mode per agent** is passed as a `thinking` parameter on each `chat.completions.create` call. The model adapter reads it from the `RunContext` (set by chat/route.ts) and forwards it to DeepSeek.
-- **The OpenAI Agents SDK's `Agent` constructor doesn't have a built-in `thinking` field** — but our `Model` adapter gets to translate the `AgentInputItem[]` into an OpenAI-shaped request, so we can add `thinking: { mode: "non_think" | "think_high" | "think_max" }` there.
+- **Reasoning mode per agent** is passed via two parameters on each `chat.completions.create` call. The model adapter reads it from the `RunContext` (set by chat/route.ts) and translates it to DeepSeek's V4 Pro API shape:
+  - **Non-Think** → `extra_body: { thinking: { type: "disabled" } }`, `reasoning_effort` omitted.
+  - **Think High** → `extra_body: { thinking: { type: "enabled" } }`, `reasoning_effort: "high"`.
+  - **Think Max** → `extra_body: { thinking: { type: "enabled" } }`, `reasoning_effort: "max"`.
+- **The OpenAI Agents SDK's `Agent` constructor doesn't have a built-in `thinking` field** — but our `Model` adapter gets to translate the `AgentInputItem[]` into an OpenAI-shaped request, so we add the two parameters there. (V4 Pro's official spec also accepts `thinking_mode: "non-thinking" | "thinking" | "thinking_max"` as a shortcut, but we stick to the explicit `extra_body` form for clarity.)
 - **Default reasoning mode per agent** lives in `registry.ts` (alongside the agent definition):
   ```ts
   export const ctoAgent = new Agent({
@@ -388,18 +411,32 @@ const stream = await runner.runStreamed(coAgent, input, {
 });
 ```
 
-The adapter reads `context.reasoning` and translates to DeepSeek's API:
+The adapter reads `context.reasoning` and translates to DeepSeek's V4 Pro API:
 
 ```ts
+// Translate our internal ReasoningMode → DeepSeek's API shape.
+function reasoningParams(mode: ReasoningMode) {
+  switch (mode) {
+    case "non_think":
+      return { reasoning_effort: undefined, extra_body: { thinking: { type: "disabled" } } };
+    case "think_high":
+      return { reasoning_effort: "high", extra_body: { thinking: { type: "enabled" } } };
+    case "think_max":
+      return { reasoning_effort: "max", extra_body: { thinking: { type: "enabled" } } };
+  }
+}
+
 const completion = await deepseek.chat.completions.create({
   model: MODEL,
   stream: true,
-  thinking: { mode: context.reasoning },
+  temperature: 1.0,   // DeepSeek recommends 1.0; default OpenAI temp 0.7 is suboptimal
+  top_p: 1.0,         // ditto
+  ...reasoningParams(context.reasoning),
   messages,
 });
 ```
 
-(DeepSeek V4 Pro's `thinking` parameter is documented in their OpenAI-compat spec. If their API uses a different name, we adjust the adapter — it's the only file that knows about it.)
+The stream yields two kinds of chunks: `delta.reasoning_content` (the CoT) and `delta.content` (the final answer). We forward only `content` to the client; `reasoning_content` stays server-side for debugging (we log it at debug level).
 
 ### 2.3 Tool definition convention
 
@@ -893,6 +930,34 @@ The rest (Python sandbox, formal CI eval, voice, etc.) are clearly v2.
 
 ---
 
+## 13. Decision log (assumptions we made and the alternatives we rejected)
+
+So an executor knows what to keep and what to push back on. Each row is a decision baked into the plan; the "alternative" column is what we'd do instead if the user changes their mind.
+
+| Decision | Chosen | Alternative | Why we chose this |
+|---|---|---|---|
+| **Agent-to-CoS communication** | Specialists can only be reached by the CoS (V1). The CoS is the only public-facing entry point. | Open swarm (any agent can be reached by name from the chat). | Keeps the user interface simple — one "CoS" name to remember. The CoS can always ask for a specific specialist. |
+| **Specialist-to-specialist channel** | New `consult_agent` tool backed by PB `agent_messages`. | (a) Handoffs only (no direct A2A). (b) In-memory bus (lost on restart). | PB-backed is observable (Team Panel sees it) and survives restarts. (a) was V1 and explicitly rejected by the user. (b) hides what's happening. |
+| **Cross-conversation memory** | Mem0 user-scope (already) + a separate `memories_global` collection for promoted identity facts. | One collection with a `global` flag. | Different retention policies. Two collections is cleaner. |
+| **State persistence** | PB `agent_state` collection, per-conversation, per-agent. | (a) Mem0 with metadata. (b) Redis. (c) In-memory. | State is structured, per-conv, changes every turn. PB is already there, queryable from the Team Panel, durable. (a) pollutes the fact store. (b)/(c) add infra. |
+| **Code execution sandbox** | `node:vm` (built-in) with safe globals. | (a) `isolated-vm` (native dep, true memory caps). (b) Docker worker. (c) Pyodide for Python. | MVP: zero new infra, handles 90% of use cases. Upgrade to (a) if we hit V8 heap issues. (b)/(c) are v2. |
+| **Conflict resolution strategies** | 3-bucket: `domain_internal` (CoS rules), `values_tradeoff` (user picks), `technical_factual` (Critic arbitrates in Think Max). | (a) Always ask the user. (b) Always let the Critic arbitrate. (c) Multi-agent voting. | (a) is annoying. (b) wastes tokens on non-technical disputes. (c) is expensive and slow. The 3-bucket is the minimum that handles the common cases. |
+| **Reasoning mode per agent** | Non-Think (utility + life), Think High (CoS + C-suite), Think Max (Critic). | (a) Think High everywhere. (b) Think Max for CoS + C-suite. | Matches the cost/quality tradeoff. Reasoning mode is the only dial; we keep it explicit in the registry. |
+| **Per-agent `thinking` API parameter** | V4 Pro: `extra_body: { thinking: { type: "enabled" \| "disabled" } }` + `reasoning_effort: "high" \| "max"`. | (a) DeepSeek's `thinking_mode: "non-thinking" \| "thinking" \| "thinking_max"` shortcut. (b) OpenAI's `reasoning_effort` only. | (a) is a shortcut, not the canonical API. (b) doesn't have a "disabled" mode. The explicit form is clearest. |
+| **Critic arbitration prompt** | Suffix: "Pick a winner. Justify with 2-3 sentences. Do not hedge." | (a) Same prompt as the regular Critic. (b) A separate "Arbitrator" agent. | (a) hedges. (b) duplicates. The suffix is the cheapest way to get a decisive verdict. |
+| **CoS's role in conflict** | The CoS picks the `conflict_type` (domain/values/technical) and calls the right resolver. | (a) The Critic always picks the type. (b) A separate "Triage" agent. | The CoS already has the full context of the question. Adding another LLM hop would slow every conflict for no quality gain. |
+| **Streaming protocol** | SSE (one-way server → client). | WebSockets (bi-directional). | SSE is simpler, plays well with Vercel/Next.js route handlers, and we don't need client-push during the turn (the conflict-resolution resume is a fresh POST). |
+| **Conflict-resolution resume** | New POST `{ kind: "conflict_resolution", conflictId, choice }` resumes the paused turn. | (a) WebSocket bidirectional. (b) Server-Sent Events from server. | (a) adds infra. (b) is more complex than a fresh POST. The current Next.js route can handle the resume with one extra branch. |
+| **Mem0 LLM** | DeepSeek V4 Pro (`deepseek-v4-pro`). | (a) `deepseek-chat` (cheaper, less smart). (b) Local Llama. | The user explicitly asked for V4 Pro. (a) is what V1 had. (b) requires a GPU. |
+| **Embedding model** | FastEmbed `BAAI/bge-small-en-v1.5` (384-dim, local CPU). | OpenAI `text-embedding-3-small`. | Free, fast, no API cost. We chose this in V1 and the user agreed. |
+| **Vector store** | Qdrant (self-hosted, multi-arch docker image). | pgvector. | Qdrant has better HNSW tuning. We chose this in V1. |
+| **Document RAG** | Raw Qdrant collection (`documents`), separate from Mem0. | Mem0 for everything. | Different retrieval semantics. RAG wants chunk-level, Mem0 wants fact-level. |
+| **Tavily (web search)** | Free tier, 1000 searches/month. | (a) Serper. (b) Bing. | Tavily has the best free tier and returns clean Markdown. |
+| **Single-user, no auth** | PocketBase admin is exposed (self-signed cert) but no user-level auth. | Cloudflare Access in front of everything. | V1 decision; the user agreed. A single password is in §12.2 T2.1. |
+| **Hosting** | Oracle Cloud Free Tier ARM A1, new VCN, new instance, full isolation from the user's other project. | Hetzner / DigitalOcean / fly.io. | V1 decision. Oracle's free tier is genuinely free; the others are $5-10/mo. |
+
+---
+
 ## 14. Open questions for the user
 
 I made a few choices to keep the plan shippable. Flag any you want to change:
@@ -921,9 +986,209 @@ The V1 plan had "send a message, get a TLDR". V2 covers all six new features:
 | **Persistent state** | In conv A, turn 1: "I'm choosing between Postgres and MongoDB for the new app." Turn 5 (in same conv): "what were we discussing?" | CoS's `agent_state.current_focus` is "Postgres vs MongoDB for the new app" and gets surfaced verbatim. |
 | **Agent-to-agent messaging** | "I'm thinking of building a new fintech app and putting it on a public S3 bucket — should I?" | Team panel shows CTO → CSO. CSO's reply mentions threat model, not just generic security. CoS's answer cites both. |
 | **V4 Pro** | `curl -s $DEEPSEEK_BASE_URL/v1/models -H "Authorization: Bearer $DEEPSEEK_API_KEY" \| jq` | `deepseek-v4-pro` is in the model list. Inspect chat logs: every `chat.completions.create` call uses `model: "deepseek-v4-pro"`. |
-| **Reasoning mode** | Ask the CoS a hard, multi-step question. Then ask the Critic to review it. | Token counts differ by ~2-4× between Think High and Think Max. Logs show `thinking: { mode: "think_max" }` for the Critic. |
+| **Reasoning mode** | Ask the CoS a hard, multi-step question. Then ask the Critic to review it. | Token counts differ by ~2-4× between Think High and Think Max. Logs show `extra_body: { thinking: { type: "enabled" } }, reasoning_effort: "max"` for the Critic. |
 | **Code execution** | "If I invest $10k at 7% for 30 years, what's it worth?" | Team panel shows "CFO ran: `Math.pow(1.07, 30) * 10000`" → output `76122.55…`. No `require` / `process` / `fetch` access. A snippet with `while(true){}` is killed in ≤5 s. |
 | **Conflict resolution** | "Should I deploy on Friday at 5pm or Monday at 9am?" (or any question where CTO and CFO disagree) | Team panel shows a `conflict` event + a `ConflictCard` with the two options. User picks one. CoS resumes the turn and writes the final answer citing the chosen option. |
 | **Critic arbitration** | Force a technical factual dispute: ask a question that triggers CTO and CSO to disagree on a number. | Team panel shows `conflict_resolved` with `Critic arbitrated: …`. Logs show the Critic was invoked with the arbitration prompt suffix. |
 
 End state: a real team of 12+ agents, one Chief of Staff on the front line, V4 Pro for every brain, with shared memory, working state, a chat channel between specialists, runnable code, and a deterministic way to resolve disagreements.
+
+---
+
+## 16. PocketBase schemas (copy-paste ready)
+
+Two new collections. Add these to [memory-service/scripts/pb_bootstrap.py](file:///workspace/superhuman-va/memory-service/scripts/pb_bootstrap.py) (the file already creates `conversations` and `messages`). The bootstrap script is idempotent — re-running is safe.
+
+### 16.1 `agent_state`
+
+Per-conversation working memory for one agent. Unique per (conv, agent).
+
+```python
+AGENT_STATE_SCHEMA = {
+    "name": "agent_state",
+    "type": "base",
+    "schema": [
+        {
+            "name": "conversation_id",
+            "type": "relation",
+            "required": True,
+            "options": {
+                "collectionId": "__CONVERSATIONS_ID__",  # filled at runtime
+                "cascadeDelete": True,
+                "maxSelect": 1,
+            },
+        },
+        {"name": "agent_name", "type": "text", "required": True, "options": {"min": 1, "max": 64}},
+        {"name": "state_json", "type": "json", "required": True, "options": {"maxSize": 65535}},
+    ],
+    "indexes": [
+        "CREATE INDEX idx_state_conv ON agent_state (conversation_id)",
+        "CREATE UNIQUE INDEX idx_state_conv_agent ON agent_state (conversation_id, agent_name)",
+    ],
+    "listRule": "",
+    "viewRule": "",
+    "createRule": "",
+    "updateRule": "",
+    "deleteRule": "",
+}
+```
+
+**Canonical state shape (CoS, see §1.4.2):**
+
+```ts
+type CosState = {
+  current_focus: string | null;
+  open_questions: string[];
+  recent_specialist_outputs: { agent: string; summary: string; turn: number }[];
+  user_preferences_this_session: Record<string, string>;
+  turn_count: number;
+};
+```
+
+### 16.2 `agent_messages`
+
+Every specialist-to-specialist consult, plus Critic arbitrations, plus the conflict-resolution records.
+
+```python
+AGENT_MESSAGES_SCHEMA = {
+    "name": "agent_messages",
+    "type": "base",
+    "schema": [
+        {
+            "name": "conversation_id",
+            "type": "relation",
+            "required": True,
+            "options": {
+                "collectionId": "__CONVERSATIONS_ID__",
+                "cascadeDelete": True,
+                "maxSelect": 1,
+            },
+        },
+        {"name": "turn_id", "type": "text", "required": True, "options": {"min": 1, "max": 64}},
+        {"name": "from_agent", "type": "text", "required": True, "options": {"min": 1, "max": 64}},
+        {"name": "to_agent", "type": "text", "required": True, "options": {"min": 1, "max": 64}},
+        {"name": "message", "type": "text", "required": True, "options": {"max": 20000}},
+        {"name": "reply", "type": "text", "required": False, "options": {"max": 20000}},
+        {
+            "name": "status",
+            "type": "select",
+            "required": True,
+            "options": {"maxSelect": 1, "values": ["pending", "replied", "errored"]},
+        },
+    ],
+    "indexes": [
+        "CREATE INDEX idx_msg_conv ON agent_messages (conversation_id)",
+        "CREATE INDEX idx_msg_turn ON agent_messages (turn_id)",
+    ],
+    "listRule": "",
+    "viewRule": "",
+    "createRule": "",
+    "updateRule": "",
+    "deleteRule": "",
+}
+```
+
+**Reserved `to_agent` values:**
+
+| Value | Meaning |
+|---|---|
+| `CoS`, `CTO`, `CFO`, `CMO`, `CSO`, `Critic`, `Memory`, `Document`, `Researcher`, `Planner`, `ADHD`, `Fitness`, `Therapist` | The actual agent. |
+| `__conflict__` | A conflict-resolution event. The `message` field is the question; `reply` is the resolution (CoS ruling / Critic verdict / user pick). |
+| `__user__` | A message addressed to the user (synthetic, for the Team Panel timeline). |
+
+---
+
+## 17. Worked example — one full turn
+
+So everyone agrees on what the system does end-to-end. The user types: **"I'm thinking of putting my new fintech app's database on a public S3 bucket so I can share query results with my co-founder. Should I?"**
+
+### 17.1 Server-side flow
+
+1. **chat/route.ts** receives `{ message, conversationId, userId }`. Creates/upserts a `conversations` row. Generates a `turn_id` (ULID).
+2. **Parallel context load**:
+   - Load last 10 messages from `messages` collection (PB).
+   - Load CoS's `agent_state` row for this conversation.
+   - Call Mem0 `listGlobalMemories(userId)` → returns 12 facts (user is a backend engineer at a fintech, user has ADHD, user is in Toronto, etc.).
+   - Call Qdrant `search_documents(user_id, query)` → returns 3 document excerpts (one is an internal "Data Classification Policy" PDF the user uploaded last week).
+3. **Build CoS input** (see §3.3 for the full template):
+   ```
+   [system: CoS prompt with global facts and working memory injected]
+   [user: last 5 turns of history]
+   [user: current message]
+   ```
+4. **Run the swarm**:
+   - `runner.runStreamed(coS, input, { context: { conversationId, userId, turnId, reasoning: "think_high" } })`
+   - The CoS decides this is a security question → calls `consult_specialist("CTO")` AND `consult_specialist("CSO")` in parallel.
+   - The CTO's turn: CTO reads the conversation, calls `consult_agent("CSO", "the user is asking about putting their fintech DB on public S3. Threat model please.")`. CTO also calls `compute("0.05 * 1000000")` to estimate breach cost.
+   - The CSO's turn: CSO reads the conversation, calls `search_documents(...)` to find the Data Classification Policy. Calls `run_code` to demonstrate a public-S3 enumeration script (sandboxed). Writes a threat model.
+   - Both replies land back at the CoS. The CoS detects disagreement (CTO says "technically possible but bad"; CSO says "block immediately, PCI-DSS violation") and decides this is a `technical_factual` conflict → calls `resolve_conflict({ conflict_type: "technical_factual", ... })`.
+   - The `resolve_conflict` tool invokes the Critic with the arbitration prompt suffix. The Critic arbitrates: "CSO is right. PCI-DSS §3.4 prohibits public exposure of cardholder data environments, and S3 buckets have a documented history of accidental public access. CTO's technical feasibility is moot." (`reasoning_effort: "max"`, `extra_body: { thinking: { type: "enabled" } }`.)
+   - The CoS writes the final answer:
+     ```
+     ## TL;DR
+     No. Putting a fintech database on a public S3 bucket is a PCI-DSS violation and a near-certain breach.
+
+     ## Recommendation
+     Use a private S3 bucket with bucket-owner-only access. If your co-founder needs query results, give them an IAM role or share a signed URL with a 24-hour expiry.
+
+     ## Details
+     (per CSO, confirmed by CTO, arbitrated by Critic) ...
+     [1,400 words of detail, a Mermaid diagram of the recommended architecture, a table comparing the three options]
+     ```
+5. **Stream to the browser** as SSE events: `meta`, `token` × N, `tool_start` × 4, `tool_done` × 4, `agent_message` × 2 (CTO↔CSO), `conflict_resolved` (Critic), `done`.
+6. **Post-stream**:
+   - Persist `user` and `assistant` messages to `messages` collection.
+   - Persist CoS's `agent_state` (last write wins). The new state has `current_focus = "Decided: private S3 + IAM role for co-founder"`, `open_questions = []`, `recent_specialist_outputs` updated.
+   - Persist the two `agent_messages` rows (CTO→CSO, plus the conflict record).
+   - Fire-and-forget `memoryClient.addMemory(userId, [user_msg, assistant_msg])` for cross-conversation fact extraction.
+
+### 17.2 Browser-side render
+
+- The chat bubble fills with the streamed CoS answer, token by token.
+- The Team Panel (right drawer) animates in this order:
+  1. 🟦 "CoS consulted: CTO, CSO"
+  2. 🟦 "CTO ran: `0.05 * 1000000` → 50000"
+  3. 🟦 "CTO → CSO: the user is asking about putting their fintech DB on public S3. Threat model please."
+  4. 🟦 "CSO ran: `for (const b of buckets) console.log(b.name)` → ['company-prod-2024', 'company-q1-backup', …]"
+  5. 🟦 "CSO: PCI-DSS §3.4 prohibits …"
+  6. 🟥 "Conflict detected (technical_factual)"
+  7. 🟦 "Critic arbitrated: CSO is right. PCI-DSS §3.4 …"
+  8. 🟩 "CoS: streaming final answer…"
+- The assistant bubble shows the final structured answer with the Mermaid diagram and the table.
+
+### 17.3 What the user sees (TL;DR of the TL;DR)
+
+A coherent, decisive, multi-source answer ("No, don't. Here's why, and here's what to do instead.") with a visible audit trail of who said what. The user can hover any Team Panel event to see the full text of the specialist's output. If they disagree with the resolution, they can re-engage: "I still think the S3 approach is fine because X" — and the CoS's `agent_state` carries the context forward.
+
+This is the day-1 demo. The full team (C-suite + life specialists + Researcher + Planner + Critic) is wired the same way; each gets added by dropping a new file into `specialists/`.
+
+---
+
+## 18. Performance targets & SLOs
+
+Quantitative bars for "the swarm is working". We measure these from day 1 and ship a small dashboard widget (§12.2 T2.2).
+
+| Metric | Target | How we measure |
+|---|---|---|
+| **Time to first token** (TTFT) | < 1.5 s p50, < 3 s p95 | Server log: `Date.now() - req.received` at the first SSE `token` event. |
+| **Tokens / second** (throughput) | > 30 t/s p50 for Non-Think, > 15 t/s p50 for Think Max | Server log: `tokens / (last_token_at - first_token_at)`. |
+| **End-to-end turn latency** (small question, no specialists) | < 4 s p50, < 8 s p95 | Same as TTFT + token time. |
+| **End-to-end turn latency** (1 specialist + 1 A2A hop) | < 12 s p50, < 25 s p95 | Server log: `req.received → done` for a 2-agent turn. |
+| **End-to-end turn latency** (3 specialists + 2 A2A hops + Critic arbitration) | < 35 s p50, < 70 s p95 | Same. |
+| **Tokens per turn** (median over 50 random turns) | < 8k input + 1.5k output | Aggregated from V4 Pro usage headers + our own counter. |
+| **Cost per turn** (median) | < $0.04 | V4 Pro pricing: $1.74/1M input, $0.55/1M output (May 2026). 8k input + 1.5k output ≈ $0.015. Headroom for specialists. |
+| **Daily cost** (target workload) | < $1.50 | 50 turns/day × $0.04 + occasional Think Max + Tavily (free tier 1k/mo). |
+| **Specialist consults per turn** (median) | 1.2 | `agent_messages` count per turn. Cap is 4 (see §1.4.3). |
+| **`run_code` calls per turn** (median) | 0.4 | Server log. Cap is 3 (see §1.4.5). |
+| **Cross-conversation memory hit rate** | > 30% | `Mem0.search` returns ≥1 result for > 30% of turns. |
+| **State persistence hit rate** | > 80% | For any turn ≥ 2 in a conversation, `agent_state` was loaded with non-empty content. |
+| **Crash rate** | < 0.1% of turns | Server log: unhandled exceptions in `chat/route.ts` / total turns. |
+
+**Where the budget goes**: V4 Pro input tokens dominate (8k input × $1.74/1M ≈ $0.014/turn). Think Max on the Critic adds ~5k extra tokens per arbitration. The two big levers to control cost are (a) the `max_agent_consults` cap and (b) the small-talk fast path.
+
+**Bottleneck analysis** (for the executor): the swarm is not V4-Pro-bound. It's bound by:
+1. **Network round-trip to DeepSeek** (~200 ms RTT to api.deepseek.com from the Oracle cloud in Toronto — could be 1.5 s from a personal laptop). Consider deploying the memory service in the same region as DeepSeek's edge.
+2. **`node:vm` startup cost** for `run_code` (~50-100 ms per call). Negligible unless we hit the cap.
+3. **PocketBase query latency** for `agent_state`/`agent_messages`. The indexes in §16 keep this sub-10 ms even at 10k rows.
+
+If TTFT p95 is over 5 s after week 1, the culprit is almost certainly network. If tokens/second is below 15, the culprit is V4 Pro Think Max blocking the stream (Think Max streams the CoT and we don't forward it — this is fine but adds latency).
